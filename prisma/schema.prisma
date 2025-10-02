@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TicketStatus {
+  QUEUED
+  CALLED
+  IN_PROCESS
+  DONE
+  DEFERRED
+  NO_SHOW
+}
+
+model Event {
+  id        String   @id @default(uuid())
+  name      String
+  startsAt  DateTime?
+  endsAt    DateTime?
+  tickets   Ticket[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Ticket {
+  id        String       @id @default(uuid())
+  code      String       @unique       // AH-101
+  name      String
+  status    TicketStatus @default(QUEUED)
+  order     Int
+  eventId   String
+  event     Event        @relation(fields: [eventId], references: [id])
+  callLogs  CallLog[]
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  @@index([eventId, status, order])
+}
+
+model Counter {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  callLogs  CallLog[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CallLog {
+  id        String   @id @default(uuid())
+  ticketId  String
+  counterId String
+  calledAt  DateTime @default(now())
+  note      String?
+  ticket    Ticket   @relation(fields: [ticketId], references: [id])
+  counter   Counter  @relation(fields: [counterId], references: [id])
+}

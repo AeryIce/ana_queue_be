@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    container_name: ana_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ana
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: ana_queue
+    ports:
+      - "5432:5432"
+    volumes:
+      - ana_pgdata:/var/lib/postgresql/data
+
+  adminer:
+    image: adminer
+    container_name: ana_adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+
+volumes:
+  ana_pgdata:
