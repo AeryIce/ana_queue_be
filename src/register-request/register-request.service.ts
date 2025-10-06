@@ -38,56 +38,87 @@ export class RegisterRequestService {
   }
 
   // ===== POST /api/register-request
-  async createRequest(input: { eventId: string; email: string; name: string; wa?: string; source?: Source }) {
-    const eventId = input.eventId
-    const email = input.email.trim().toLowerCase()
-    const name = input.name.trim()
-    const wa = input.wa?.trim() ?? null
-    let source: Source = input.source === 'GIMMICK' ? 'GIMMICK' : 'MASTER'
+  // POST /api/register-request (IDEMPOTENT BY eventId+email on PENDING)
+async createRequest(input: { eventId: string; email: string; name: string; wa?: string; source?: Source }) {
+  const eventId = input.eventId
+  const email = input.email.trim().toLowerCase()
+  const name = input.name.trim()
+  const wa = input.wa?.trim() ?? null
+  let source: Source = input.source === 'GIMMICK' ? 'GIMMICK' : 'MASTER'
 
-    // cek master user (pakai accessor yang sudah ada)
-    const mu = await this.prisma.masterUser.findUnique({ where: { email } })
-    if (!mu) source = input.source === 'GIMMICK' ? 'GIMMICK' : 'WALKIN'
+  // 0) Cek apakah sudah ada PENDING untuk (eventId,email)
+  const existing = await this.prisma.$queryRaw<Array<{
+    id: string; eventId: string; email: string; name: string; wa: string | null;
+    source: Source; status: 'PENDING' | 'CONFIRMED' | 'CANCELLED';
+    isMasterMatch: boolean | null; masterQuota: number | null; issuedBefore: number | null;
+    createdAt: Date;
+  }>>`
+    SELECT "id","eventId","email","name","wa","source","status",
+           "isMasterMatch","masterQuota","issuedBefore","createdAt"
+    FROM "RegistrationRequest"
+    WHERE "eventId" = ${eventId} AND "email" = ${email} AND "status" = 'PENDING'
+    LIMIT 1;
+  `
 
-    // hitung tiket yang sudah pernah dibuat untuk email-event (kolom email baru → raw SQL)
-    const issuedRow = await this.prisma.$queryRaw<Array<{ count: number }>>`
-      SELECT COUNT(*)::int AS count
-      FROM "Ticket"
-      WHERE "eventId" = ${eventId} AND "email" = ${email};
-    `
-    const issuedBefore = issuedRow?.[0]?.count ?? 0
-    const masterQuota = mu?.quota ?? 0
-    const quotaRemaining = Math.max(0, masterQuota - issuedBefore)
+  // ambil pool untuk response
+  const poolRemainingBefore = await this.getPoolRemaining(eventId)
 
-    // simpan request PENDING (raw SQL)
-    const id = randomUUID()
-    await this.prisma.$executeRaw`
-      INSERT INTO "RegistrationRequest"
-        ("id","eventId","email","name","wa","source","status","isMasterMatch","masterQuota","issuedBefore","createdAt","updatedAt")
-      VALUES
-        (${id}, ${eventId}, ${email}, ${name}, ${wa}, ${source}, 'PENDING', ${!!mu}, ${mu?.quota ?? null}, ${issuedBefore}, NOW(), NOW());
-    `
-
-    const poolRemaining = await this.getPoolRemaining(eventId)
-
+  if (existing.length > 0) {
+    const it = existing[0]
+    const masterQuota0 = it.masterQuota ?? 0
+    const issuedBefore0 = it.issuedBefore ?? 0
+    const quotaRemaining0 = Math.max(0, masterQuota0 - issuedBefore0)
     return {
       ok: true,
-      request: {
-        id,
-        eventId,
-        email,
-        name,
-        wa,
-        source,
-        status: 'PENDING',
-        isMasterMatch: !!mu,
-        masterQuota,
-        issuedBefore,
-        quotaRemaining
-      },
-      poolRemaining
+      dedup: true,                       // <— flag info: ini hasil dedup
+      request: { ...it, quotaRemaining: quotaRemaining0 },
+      poolRemaining: poolRemainingBefore
     }
   }
+
+  // 1) Cek master user (untuk metadata)
+  const mu = await this.prisma.masterUser.findUnique({ where: { email } })
+  if (!mu) source = input.source === 'GIMMICK' ? 'GIMMICK' : 'WALKIN'
+
+  // 2) Hitung tiket yang sudah ada untuk email-event (kolom email baru → raw SQL)
+  const issuedRow = await this.prisma.$queryRaw<Array<{ count: number }>>`
+    SELECT COUNT(*)::int AS count
+    FROM "Ticket"
+    WHERE "eventId" = ${eventId} AND "email" = ${email};
+  `
+  const issuedBefore = issuedRow?.[0]?.count ?? 0
+  const masterQuota = mu?.quota ?? 0
+  const quotaRemaining = Math.max(0, masterQuota - issuedBefore)
+
+  // 3) Simpan request baru (PENDING)
+  const id = randomUUID()
+  await this.prisma.$executeRaw`
+    INSERT INTO "RegistrationRequest"
+      ("id","eventId","email","name","wa","source","status","isMasterMatch","masterQuota","issuedBefore","createdAt","updatedAt")
+    VALUES
+      (${id}, ${eventId}, ${email}, ${name}, ${wa}, ${source}, 'PENDING', ${!!mu}, ${mu?.quota ?? null}, ${issuedBefore}, NOW(), NOW());
+  `
+
+  return {
+    ok: true,
+    dedup: false,
+    request: {
+      id,
+      eventId,
+      email,
+      name,
+      wa,
+      source,
+      status: 'PENDING',
+      isMasterMatch: !!mu,
+      masterQuota,
+      issuedBefore,
+      quotaRemaining,
+    },
+  poolRemaining: poolRemainingBefore
+  }
+}
+
 
   // ===== GET /api/register-queue?eventId=...
   async listPending(eventId: string) {
@@ -114,6 +145,85 @@ export class RegisterRequestService {
     const poolRemaining = await this.getPoolRemaining(eventId)
     return { ok: true, eventId, poolRemaining, pending }
   }
+  // GET /api/registrants?eventId=...&status=...&source=...&q=...&limit=...&offset=...
+async listRegistrants(params: {
+  eventId: string
+  status?: 'PENDING' | 'CONFIRMED' | 'CANCELLED' | 'ALL'
+  source?: 'MASTER' | 'WALKIN' | 'GIMMICK' | 'ALL'
+  q?: string
+  limit?: number
+  offset?: number
+}) {
+  const { eventId } = params
+  const status = (params.status ?? 'ALL') as any
+  const source = (params.source ?? 'ALL') as any
+  const q = params.q?.trim()
+  const limit = Math.max(1, Math.min(Number(params.limit ?? 50), 200))
+  const offset = Math.max(0, Number(params.offset ?? 0))
+
+  // build WHERE dinamis (pakai $queryRawUnsafe untuk binding parameter)
+  const whereParts: string[] = [`"eventId" = $1`]
+  const args: any[] = [eventId]
+  let argIdx = 1
+
+  if (status !== 'ALL') {
+    argIdx++; whereParts.push(`"status" = $${argIdx}`); args.push(status)
+  }
+  if (source !== 'ALL') {
+    argIdx++; whereParts.push(`"source" = $${argIdx}`); args.push(source)
+  }
+  if (q && q.length > 0) {
+    const like = `%${q}%`
+    argIdx++; const p = `$${argIdx}`
+    whereParts.push(`("email" ILIKE ${p} OR "name" ILIKE ${p} OR "wa" ILIKE ${p})`)
+    args.push(like)
+  }
+
+  const whereSql = whereParts.join(' AND ')
+  const baseSql = `FROM "RegistrationRequest" WHERE ${whereSql}`
+
+  // total count
+  const countRow = await this.prisma.$queryRawUnsafe<Array<{ count: number }>>(
+    `SELECT COUNT(*)::int AS count ${baseSql};`, ...args
+  )
+  const total = countRow?.[0]?.count ?? 0
+
+  // ambil rows
+  argIdx++; const pLimit = `$${argIdx}`; args.push(limit)
+  argIdx++; const pOffset = `$${argIdx}`; args.push(offset)
+
+  const rows = await this.prisma.$queryRawUnsafe<Array<{
+    id: string; eventId: string; email: string; name: string; wa: string | null;
+    source: 'MASTER'|'WALKIN'|'GIMMICK'; status: 'PENDING'|'CONFIRMED'|'CANCELLED';
+    isMasterMatch: boolean | null; masterQuota: number | null; issuedBefore: number | null;
+    createdAt: Date; updatedAt: Date;
+  }>>(
+    `SELECT "id","eventId","email","name","wa","source","status",
+            "isMasterMatch","masterQuota","issuedBefore","createdAt","updatedAt"
+     ${baseSql}
+     ORDER BY "createdAt" ASC
+     LIMIT ${pLimit} OFFSET ${pOffset};`,
+    ...args
+  )
+
+  // hitung quotaRemaining untuk yang MASTER
+  const items = rows.map(it => {
+    const masterQuota = it.masterQuota ?? 0
+    const issuedBefore = it.issuedBefore ?? 0
+    const quotaRemaining = Math.max(0, masterQuota - issuedBefore)
+    return { ...it, quotaRemaining }
+  })
+
+  return {
+    ok: true,
+    eventId,
+    total,
+    limit,
+    offset,
+    items
+  }
+}
+
 
   // ===== POST /api/register-confirm
   async confirm(input: { requestId: string; useCount: number }) {
