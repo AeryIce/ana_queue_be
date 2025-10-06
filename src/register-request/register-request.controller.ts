@@ -19,4 +19,13 @@ export class RegisterRequestController {
     if (!eventId) return { ok: false, error: 'eventId wajib diisi' }
     return this.svc.listPending(eventId)
   }
+
+  @Post('register-confirm')
+  async confirm(@Body() body: { requestId?: string; useCount?: number }) {
+    if (!body?.requestId) return { ok: false, error: 'requestId wajib diisi' }
+    if (!Number.isInteger(body?.useCount) || (body?.useCount as number) <= 0) {
+      return { ok: false, error: 'useCount harus bilangan > 0' }
+    }
+    return this.svc.confirm({ requestId: body.requestId, useCount: Number(body.useCount) })
+  }
 }

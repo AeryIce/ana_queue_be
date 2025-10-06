@@ -2,23 +2,24 @@ import { PrismaClient } from '@prisma/client'
 const prisma = new PrismaClient()
 
 async function main() {
-  const eventId = 'seed-event' // ganti kalau eventId kamu berbeda
+  const eventId = 'seed-event' // ubah kalau eventId kamu berbeda
+  const counterTable = 'queue_counters'
 
-  // Pastikan event ada
-  await prisma.event.upsert({
-    where: { id: eventId },
-    update: {},
-    create: { id: eventId, name: 'Seed Event' },
-  })
+  // Pastikan Event ada
+  await prisma.$executeRawUnsafe(`
+    INSERT INTO "Event" ("id","name","createdAt","updatedAt")
+    VALUES ($1, 'Seed Event', NOW(), NOW())
+    ON CONFLICT ("id") DO NOTHING;
+  `, eventId)
 
-  // Siapkan counter nomor urut
-  await prisma.queueCounter.upsert({
-    where: { eventId },
-    update: {},
-    create: { eventId, nextOrder: 1 },
-  })
+  // Pastikan QueueCounter ada
+  await prisma.$executeRawUnsafe(`
+    INSERT INTO "${counterTable}" ("id","eventId","name","nextOrder","createdAt","updatedAt")
+    VALUES (gen_random_uuid(), $1, 'Default Counter', 1, NOW(), NOW())
+    ON CONFLICT ("eventId") DO NOTHING;
+  `, eventId)
 
-  console.log('✅ QueueCounter ready for', eventId)
+  console.log('✅ QueueCounter seeded successfully for', eventId)
 }
 
 main()
