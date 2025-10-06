@@ -7,6 +7,9 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/**
+ * ===== ENUM =====
+ */
 enum TicketStatus {
   QUEUED
   CALLED
@@ -16,19 +19,23 @@ enum TicketStatus {
   NO_SHOW
 }
 
+/**
+ * ===== MODELS =====
+ */
 model Event {
-  id        String   @id @default(uuid())
-  name      String
-  startsAt  DateTime?
-  endsAt    DateTime?
-  tickets   Ticket[]
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           String         @id @default(uuid())
+  name         String
+  startsAt     DateTime?
+  endsAt       DateTime?
+  tickets      Ticket[]
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  QueueCounter QueueCounter[]
 }
 
 model Ticket {
   id        String       @id @default(uuid())
-  code      String       @unique       // AH-101
+  code      String       @unique // contoh: AH-101
   name      String
   status    TicketStatus @default(QUEUED)
   order     Int
@@ -38,15 +45,20 @@ model Ticket {
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 
+  // NEW (nullable dulu agar migrasi aman ke data lama)
+  email String? // lowercase, untuk kuota per email
+  wa    String? // opsional
+
   @@index([eventId, status, order])
+  @@index([eventId, email])
 }
 
 model Counter {
-  id        String   @id @default(uuid())
-  name      String   @unique
+  id        String    @id @default(uuid())
+  name      String    @unique
   callLogs  CallLog[]
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
 }
 
 model CallLog {
@@ -55,6 +67,70 @@ model CallLog {
   counterId String
   calledAt  DateTime @default(now())
   note      String?
-  ticket    Ticket   @relation(fields: [ticketId], references: [id])
-  counter   Counter  @relation(fields: [counterId], references: [id])
+
+  ticket  Ticket  @relation(fields: [ticketId], references: [id])
+  counter Counter @relation(fields: [counterId], references: [id])
+}
+
+model MasterUser {
+  id        Int      @id @default(autoincrement())
+  firstName String
+  lastName  String
+  email     String   @unique // simpan lowercase
+  quota     Int      @default(1)
+  createdAt DateTime @default(now())
+}
+
+/**
+ * ===== COUNTER ATOMIK UNTUK NOMOR BERURUTAN =====
+ */
+model QueueCounter {
+  eventId   String @id
+  nextOrder Int    @default(1) // nomor antrian berikutnya untuk event ini
+
+  event Event @relation(fields: [eventId], references: [id])
+
+  @@map("queue_counters")
+}
+
+// === ENUM status permintaan registrasi (meja panitia)
+enum RegistrationStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+}
+
+// === Semua submit form masuk sini (grid panitia)
+model RegistrationRequest {
+  id      String             @id @default(uuid())
+  eventId String
+  email   String
+  name    String
+  wa      String?
+  source  String             @default("MASTER") // MASTER | WALKIN | GIMMICK
+  status  RegistrationStatus @default(PENDING)
+
+  // metadata validasi (opsional)
+  isMasterMatch Boolean? // true jika email ada di MasterUser
+  masterQuota   Int? // kuota dari master
+  issuedBefore  Int? // tiket yang sudah pernah diambil email ini
+
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId, status, createdAt])
+}
+
+// === Buku besar sisa-kuota (transparan & diaudit)
+model SurplusLedger {
+  id           String   @id @default(uuid())
+  eventId      String
+  type         String // "DONATE" | "ALLOCATE"
+  email        String // donor atau penerima
+  amount       Int // selalu positif
+  refRequestId String? // optional: jejak request yang memicu
+  createdAt    DateTime @default(now())
+
+  @@index([eventId, createdAt])
 }
