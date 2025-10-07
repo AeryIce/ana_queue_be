@@ -6,7 +6,6 @@ import { RegisterRequestDto } from './register-request.dto'
 export class RegisterRequestController {
   constructor(private readonly svc: RegisterRequestService) {}
 
-  // === 1) POST /api/register-request ===
   @Post('register-request')
   async create(@Body() dto: RegisterRequestDto) {
     if (!dto?.eventId || !dto?.email || !dto?.name) {
@@ -15,14 +14,15 @@ export class RegisterRequestController {
     return this.svc.createRequest(dto)
   }
 
-  // === 2) GET /api/register-queue ===
   @Get('register-queue')
-  async list(@Query('eventId') eventId?: string) {
+  async list(
+    @Query('eventId') eventId?: string,
+    @Query('status') status?: 'PENDING'|'CONFIRMED'|'CANCELLED'|'ALL',
+  ) {
     if (!eventId) return { ok: false, error: 'eventId wajib diisi' }
-    return this.svc.listPending(eventId)
+    return this.svc.listQueue({ eventId, status: (status as any) ?? 'PENDING' })
   }
 
-  // === 3) POST /api/register-confirm ===
   @Post('register-confirm')
   async confirm(@Body() body: { requestId?: string; useCount?: number }) {
     if (!body?.requestId) return { ok: false, error: 'requestId wajib diisi' }
@@ -32,26 +32,18 @@ export class RegisterRequestController {
     return this.svc.confirm({ requestId: body.requestId, useCount: Number(body.useCount) })
   }
 
-  // === 4) GET /api/pool?eventId=... ===
   @Get('pool')
   async getPool(@Query('eventId') eventId?: string) {
     if (!eventId) return { ok: false, error: 'eventId wajib diisi' }
-    const poolRemaining = await this.svc['getPoolRemaining'](eventId)
+    const poolRemaining = await (this.svc as any)['getPoolRemaining'](eventId)
     return { ok: true, eventId, poolRemaining }
   }
 
-  // === 5) GET /api/registrants ===
-  // Params:
-  //   - status: PENDING|CONFIRMED|CANCELLED|ALL (default ALL)
-  //   - source: MASTER|WALKIN|GIMMICK|ALL (default ALL)
-  //   - q: keyword (email/nama/wa)
-  //   - limit: default 50 (max 200)
-  //   - offset: default 0
   @Get('registrants')
   async registrants(
     @Query('eventId') eventId?: string,
-    @Query('status') status?: 'PENDING' | 'CONFIRMED' | 'CANCELLED' | 'ALL',
-    @Query('source') source?: 'MASTER' | 'WALKIN' | 'GIMMICK' | 'ALL',
+    @Query('status') status?: 'PENDING'|'CONFIRMED'|'CANCELLED'|'ALL',
+    @Query('source') source?: 'MASTER'|'WALKIN'|'GIMMICK'|'ALL',
     @Query('q') q?: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
@@ -62,6 +54,22 @@ export class RegisterRequestController {
       status: (status as any) ?? 'ALL',
       source: (source as any) ?? 'ALL',
       q,
+      limit: limit ? Number(limit) : undefined,
+      offset: offset ? Number(offset) : undefined,
+    })
+  }
+
+  @Get('tickets')
+  async tickets(
+    @Query('eventId') eventId?: string,
+    @Query('status') status?: 'QUEUED'|'CALLED'|'IN_PROCESS'|'DONE'|'DEFERRED'|'NO_SHOW'|'ALL',
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    if (!eventId) return { ok: false, error: 'eventId wajib diisi' }
+    return this.svc.listTickets({
+      eventId,
+      status: (status as any) ?? 'QUEUED',
       limit: limit ? Number(limit) : undefined,
       offset: offset ? Number(offset) : undefined,
     })
