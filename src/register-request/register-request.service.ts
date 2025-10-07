@@ -4,6 +4,10 @@ import { PrismaService } from '../prisma.service'
 
 type Source = 'MASTER' | 'WALKIN' | 'GIMMICK'
 
+const PERIPLUS_URL =
+  process.env.PERIPLUS_URL ||
+  'https://www.periplus.com/index.php?route=product/category&sar=1&author=Huang,%20Ana'
+
 @NestInjectable()
 export class RegisterRequestService {
   constructor(private readonly prisma: PrismaService) {}
@@ -39,11 +43,12 @@ export class RegisterRequestService {
     const wa = input.wa?.trim() ?? null
     let source: Source = input.source === 'GIMMICK' ? 'GIMMICK' : 'MASTER'
 
+    // Cek RegistrationRequest aktif (PENDING/CONFIRMED)
     const existing = await this.prisma.$queryRawUnsafe(
       `SELECT "id","eventId","email","name","wa","source","status",
               "isMasterMatch","masterQuota","issuedBefore","createdAt"
        FROM "RegistrationRequest"
-       WHERE "eventId" = $1 AND "email" = $2 AND "status" = 'PENDING'
+       WHERE "eventId" = $1 AND "email" = $2 AND "status"::text IN ('PENDING','CONFIRMED')
        LIMIT 1;`,
       eventId, email
     ) as Array<{
@@ -53,20 +58,38 @@ export class RegisterRequestService {
       createdAt: Date;
     }>
 
-    const poolRemainingBefore = await this.getPoolRemaining(eventId)
-
     if (existing.length > 0) {
-      const it = existing[0]
-      const masterQuota0 = it.masterQuota ?? 0
-      const issuedBefore0 = it.issuedBefore ?? 0
-      const quotaRemaining0 = Math.max(0, masterQuota0 - issuedBefore0)
+      // Blokir: sudah terdaftar pada event ini
       return {
-        ok: true,
-        dedup: true,
-        request: { ...it, quotaRemaining: quotaRemaining0 },
-        poolRemaining: poolRemainingBefore
+        ok: false,
+        code: 'ALREADY_REGISTERED',
+        message: 'Email ini sudah terdaftar pada event ini.',
+        next: { label: 'Lihat buku Ana Huang', url: PERIPLUS_URL }
       }
     }
+
+    // Cek Ticket aktif (status != DONE/CANCELLED)
+    const activeTicket = await this.prisma.$queryRawUnsafe(
+      `SELECT 1
+         FROM "Ticket"
+        WHERE "eventId" = $1
+          AND "email" = $2
+          AND "status"::text NOT IN ('DONE','CANCELLED')
+        LIMIT 1;`,
+      eventId, email
+    ) as Array<any>
+
+    if (activeTicket.length > 0) {
+      // Blokir: sudah punya tiket aktif
+      return {
+        ok: false,
+        code: 'ALREADY_REGISTERED',
+        message: 'Email ini sudah memiliki tiket aktif pada event ini.',
+        next: { label: 'Lihat buku Ana Huang', url: PERIPLUS_URL }
+      }
+    }
+
+    const poolRemainingBefore = await this.getPoolRemaining(eventId)
 
     const mu = await this.prisma.masterUser.findUnique({ where: { email } })
     if (!mu) source = input.source === 'GIMMICK' ? 'GIMMICK' : 'WALKIN'
@@ -103,145 +126,145 @@ export class RegisterRequestService {
   }
 
   async listQueue(params: { eventId: string; status?: 'PENDING'|'CONFIRMED'|'CANCELLED'|'ALL' }) {
-  const { eventId } = params
-  const status = (params.status ?? 'PENDING') as string
+    const { eventId } = params
+    const status = (params.status ?? 'PENDING') as string
 
-  const args: any[] = [eventId]
-  let whereSql = `"eventId" = $1`
-  if (status !== 'ALL') {
-    args.push(status)
-    whereSql += ` AND "status"::text = $2`
+    const args: any[] = [eventId]
+    let whereSql = `"eventId" = $1`
+    if (status !== 'ALL') {
+      args.push(status)
+      whereSql += ` AND "status"::text = $2`
+    }
+
+    const rows = await this.prisma.$queryRawUnsafe(
+      `SELECT "id","eventId","email","name","wa","source","status",
+              "isMasterMatch","masterQuota","issuedBefore","createdAt"
+       FROM "RegistrationRequest"
+       WHERE ${whereSql}
+       ORDER BY "createdAt" ASC;`,
+      ...args
+    ) as Array<{
+      id: string; eventId: string; email: string; name: string; wa: string | null;
+      source: 'MASTER'|'WALKIN'|'GIMMICK'; status: 'PENDING'|'CONFIRMED'|'CANCELLED';
+      isMasterMatch: boolean | null; masterQuota: number | null; issuedBefore: number | null;
+      createdAt: Date;
+    }>
+
+    const items = rows.map(it => {
+      const masterQuota = it.masterQuota ?? 0
+      const issuedBefore = it.issuedBefore ?? 0
+      const quotaRemaining = Math.max(0, masterQuota - issuedBefore)
+      return { ...it, quotaRemaining }
+    })
+
+    const poolRemaining = await this.getPoolRemaining(eventId)
+    return { ok: true, eventId, status, poolRemaining, items }
   }
-
-  const rows = await this.prisma.$queryRawUnsafe(
-    `SELECT "id","eventId","email","name","wa","source","status",
-            "isMasterMatch","masterQuota","issuedBefore","createdAt"
-     FROM "RegistrationRequest"
-     WHERE ${whereSql}
-     ORDER BY "createdAt" ASC;`,
-    ...args
-  ) as Array<{
-    id: string; eventId: string; email: string; name: string; wa: string | null;
-    source: 'MASTER'|'WALKIN'|'GIMMICK'; status: 'PENDING'|'CONFIRMED'|'CANCELLED';
-    isMasterMatch: boolean | null; masterQuota: number | null; issuedBefore: number | null;
-    createdAt: Date;
-  }>
-
-  const items = rows.map(it => {
-    const masterQuota = it.masterQuota ?? 0
-    const issuedBefore = it.issuedBefore ?? 0
-    const quotaRemaining = Math.max(0, masterQuota - issuedBefore)
-    return { ...it, quotaRemaining }
-  })
-
-  const poolRemaining = await this.getPoolRemaining(eventId)
-  return { ok: true, eventId, status, poolRemaining, items }
-}
 
 
   async listRegistrants(params: {
-  eventId: string
-  status?: 'PENDING' | 'CONFIRMED' | 'CANCELLED' | 'ALL'
-  source?: 'MASTER' | 'WALKIN' | 'GIMMICK' | 'ALL'
-  q?: string
-  limit?: number
-  offset?: number
-}) {
-  const { eventId } = params
-  const status = (params.status ?? 'ALL') as string
-  const source = (params.source ?? 'ALL') as string
-  const q = params.q?.trim()
-  const limit = Math.max(1, Math.min(Number(params.limit ?? 50), 200))
-  const offset = Math.max(0, Number(params.offset ?? 0))
+    eventId: string
+    status?: 'PENDING' | 'CONFIRMED' | 'CANCELLED' | 'ALL'
+    source?: 'MASTER' | 'WALKIN' | 'GIMMICK' | 'ALL'
+    q?: string
+    limit?: number
+    offset?: number
+  }) {
+    const { eventId } = params
+    const status = (params.status ?? 'ALL') as string
+    const source = (params.source ?? 'ALL') as string
+    const q = params.q?.trim()
+    const limit = Math.max(1, Math.min(Number(params.limit ?? 50), 200))
+    const offset = Math.max(0, Number(params.offset ?? 0))
 
-  const whereParts: string[] = [`"eventId" = $1`]
-  const args: any[] = [eventId]
-  let idx = 1
+    const whereParts: string[] = [`"eventId" = $1`]
+    const args: any[] = [eventId]
+    let idx = 1
 
-  if (status !== 'ALL') { idx++; whereParts.push(`"status"::text = $${idx}`); args.push(status) }
-  if (source !== 'ALL') { idx++; whereParts.push(`"source"::text = $${idx}`); args.push(source) }
-  if (q && q.length > 0) {
-    const like = `%${q}%`
-    idx++; const p = `$${idx}`
-    whereParts.push(`("email" ILIKE ${p} OR "name" ILIKE ${p} OR "wa" ILIKE ${p})`)
-    args.push(like)
+    if (status !== 'ALL') { idx++; whereParts.push(`"status"::text = $${idx}`); args.push(status) }
+    if (source !== 'ALL') { idx++; whereParts.push(`"source"::text = $${idx}`); args.push(source) }
+    if (q && q.length > 0) {
+      const like = `%${q}%`
+      idx++; const p = `$${idx}`
+      whereParts.push(`("email" ILIKE ${p} OR "name" ILIKE ${p} OR "wa" ILIKE ${p})`)
+      args.push(like)
+    }
+
+    const whereSql = whereParts.join(' AND ')
+    const baseSql = `FROM "RegistrationRequest" WHERE ${whereSql}`
+
+    const cnt = await this.prisma.$queryRawUnsafe(`SELECT COUNT(*)::int AS count ${baseSql};`, ...args) as Array<{ count: number }>
+    const total = cnt?.[0]?.count ?? 0
+
+    idx++; const pLimit = `$${idx}`; args.push(limit)
+    idx++; const pOffset = `$${idx}`; args.push(offset)
+
+    const rows = await this.prisma.$queryRawUnsafe(
+      `SELECT "id","eventId","email","name","wa","source","status",
+              "isMasterMatch","masterQuota","issuedBefore","createdAt","updatedAt"
+       ${baseSql}
+       ORDER BY "createdAt" ASC
+       LIMIT ${pLimit} OFFSET ${pOffset};`,
+      ...args
+    ) as Array<{
+      id: string; eventId: string; email: string; name: string; wa: string | null;
+      source: 'MASTER'|'WALKIN'|'GIMMICK'; status: 'PENDING'|'CONFIRMED'|'CANCELLED';
+      isMasterMatch: boolean | null; masterQuota: number | null; issuedBefore: number | null;
+      createdAt: Date; updatedAt: Date;
+    }>
+
+    const items = rows.map(it => {
+      const masterQuota = it.masterQuota ?? 0
+      const issuedBefore = it.issuedBefore ?? 0
+      const quotaRemaining = Math.max(0, masterQuota - issuedBefore)
+      return { ...it, quotaRemaining }
+    })
+
+    return { ok: true, eventId, total, limit, offset, items }
   }
-
-  const whereSql = whereParts.join(' AND ')
-  const baseSql = `FROM "RegistrationRequest" WHERE ${whereSql}`
-
-  const cnt = await this.prisma.$queryRawUnsafe(`SELECT COUNT(*)::int AS count ${baseSql};`, ...args) as Array<{ count: number }>
-  const total = cnt?.[0]?.count ?? 0
-
-  idx++; const pLimit = `$${idx}`; args.push(limit)
-  idx++; const pOffset = `$${idx}`; args.push(offset)
-
-  const rows = await this.prisma.$queryRawUnsafe(
-    `SELECT "id","eventId","email","name","wa","source","status",
-            "isMasterMatch","masterQuota","issuedBefore","createdAt","updatedAt"
-     ${baseSql}
-     ORDER BY "createdAt" ASC
-     LIMIT ${pLimit} OFFSET ${pOffset};`,
-    ...args
-  ) as Array<{
-    id: string; eventId: string; email: string; name: string; wa: string | null;
-    source: 'MASTER'|'WALKIN'|'GIMMICK'; status: 'PENDING'|'CONFIRMED'|'CANCELLED';
-    isMasterMatch: boolean | null; masterQuota: number | null; issuedBefore: number | null;
-    createdAt: Date; updatedAt: Date;
-  }>
-
-  const items = rows.map(it => {
-    const masterQuota = it.masterQuota ?? 0
-    const issuedBefore = it.issuedBefore ?? 0
-    const quotaRemaining = Math.max(0, masterQuota - issuedBefore)
-    return { ...it, quotaRemaining }
-  })
-
-  return { ok: true, eventId, total, limit, offset, items }
-}
 
   async listTickets(params: {
-  eventId: string
-  status?: 'QUEUED'|'CALLED'|'IN_PROCESS'|'DONE'|'DEFERRED'|'NO_SHOW'|'ALL'
-  limit?: number
-  offset?: number
-}) {
-  const { eventId } = params
-  const status = (params.status ?? 'QUEUED') as string
-  const limit = Math.max(1, Math.min(Number(params.limit ?? 100), 500))
-  const offset = Math.max(0, Number(params.offset ?? 0))
+    eventId: string
+    status?: 'QUEUED'|'CALLED'|'IN_PROCESS'|'DONE'|'DEFERRED'|'NO_SHOW'|'ALL'
+    limit?: number
+    offset?: number
+  }) {
+    const { eventId } = params
+    const status = (params.status ?? 'QUEUED') as string
+    const limit = Math.max(1, Math.min(Number(params.limit ?? 100), 500))
+    const offset = Math.max(0, Number(params.offset ?? 0))
 
-  const args: any[] = [eventId]
-  let whereSql = `"eventId" = $1`
-  if (status !== 'ALL') {
-    args.push(status)
-    whereSql += ` AND "status"::text = $2`
+    const args: any[] = [eventId]
+    let whereSql = `"eventId" = $1`
+    if (status !== 'ALL') {
+      args.push(status)
+      whereSql += ` AND "status"::text = $2`
+    }
+
+    const rows = await this.prisma.$queryRawUnsafe(
+      `SELECT "code","order","status","email","name","wa","createdAt"
+       FROM "Ticket"
+       WHERE ${whereSql}
+       ORDER BY "order" ASC
+       LIMIT $${args.length + 1} OFFSET $${args.length + 2};`,
+      ...args, limit, offset
+    ) as Array<{ code: string; order: number; status: string; email: string | null; name: string | null; wa: string | null; createdAt: Date }>
+
+    const totalRow = await this.prisma.$queryRawUnsafe(
+      `SELECT COUNT(*)::int AS count FROM "Ticket" WHERE ${whereSql};`,
+      ...args
+    ) as Array<{ count: number }>
+
+    return {
+      ok: true,
+      eventId,
+      status,
+      limit,
+      offset,
+      total: totalRow?.[0]?.count ?? rows.length,
+      items: rows
+    }
   }
-
-  const rows = await this.prisma.$queryRawUnsafe(
-    `SELECT "code","order","status","email","name","wa","createdAt"
-     FROM "Ticket"
-     WHERE ${whereSql}
-     ORDER BY "order" ASC
-     LIMIT $${args.length + 1} OFFSET $${args.length + 2};`,
-    ...args, limit, offset
-  ) as Array<{ code: string; order: number; status: string; email: string | null; name: string | null; wa: string | null; createdAt: Date }>
-
-  const totalRow = await this.prisma.$queryRawUnsafe(
-    `SELECT COUNT(*)::int AS count FROM "Ticket" WHERE ${whereSql};`,
-    ...args
-  ) as Array<{ count: number }>
-
-  return {
-    ok: true,
-    eventId,
-    status,
-    limit,
-    offset,
-    total: totalRow?.[0]?.count ?? rows.length,
-    items: rows
-  }
-}
 
   async confirm(input: { requestId: string; useCount: number }) {
     const { requestId } = input

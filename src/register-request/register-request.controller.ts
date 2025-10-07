@@ -6,11 +6,9 @@ import { RegisterRequestDto } from './register-request.dto'
 export class RegisterRequestController {
   constructor(private readonly svc: RegisterRequestService) {}
 
-  @Post('register-request')
+  @Post()
   async create(@Body() dto: RegisterRequestDto) {
-    if (!dto?.eventId || !dto?.email || !dto?.name) {
-      return { ok: false, error: 'eventId, email, name wajib diisi' }
-    }
+    // Selalu HTTP 200 supaya FE gampang handle { ok: boolean }
     return this.svc.createRequest(dto)
   }
 
