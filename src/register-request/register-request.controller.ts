@@ -1,12 +1,12 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common'
 import { RegisterRequestService } from './register-request.service'
-import { RegisterRequestDto } from './register-request.dto'
+import { RegisterRequestDto } from './register-request.dto' // <-- pastikan ini
 
 @Controller('api')
 export class RegisterRequestController {
   constructor(private readonly svc: RegisterRequestService) {}
 
-  @Post()
+  @Post('register-request') // <-- tambah path biar jadi /api/register-request
   async create(@Body() dto: RegisterRequestDto) {
     // Selalu HTTP 200 supaya FE gampang handle { ok: boolean }
     return this.svc.createRequest(dto)
