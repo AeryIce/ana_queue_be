@@ -39,11 +39,13 @@ export class RegisterRequestService {
     const wa = input.wa?.trim() ?? null
     let source: Source = input.source === 'GIMMICK' ? 'GIMMICK' : 'MASTER'
 
+    // 🔒 Perketat: tolak jika sudah ada PENDING atau CONFIRMED
     const existing = await this.prisma.$queryRawUnsafe(
       `SELECT "id","eventId","email","name","wa","source","status",
               "isMasterMatch","masterQuota","issuedBefore","createdAt"
        FROM "RegistrationRequest"
-       WHERE "eventId" = $1 AND "email" = $2 AND "status" = 'PENDING'
+       WHERE "eventId" = $1 AND "email" = $2 AND "status" IN ('PENDING','CONFIRMED')
+       ORDER BY CASE "status" WHEN 'PENDING' THEN 0 ELSE 1 END
        LIMIT 1;`,
       eventId, email
     ) as Array<{
@@ -60,6 +62,18 @@ export class RegisterRequestService {
       const masterQuota0 = it.masterQuota ?? 0
       const issuedBefore0 = it.issuedBefore ?? 0
       const quotaRemaining0 = Math.max(0, masterQuota0 - issuedBefore0)
+
+      if (it.status === 'CONFIRMED') {
+        // Sudah terdaftar: jangan insert, beri sinyal halus ke FE
+        return {
+          ok: true,
+          alreadyRegistered: true,
+          request: { ...it, quotaRemaining: quotaRemaining0 },
+          poolRemaining: poolRemainingBefore,
+        }
+      }
+
+      // Masih PENDING: dedup seperti biasa
       return {
         ok: true,
         dedup: true,
@@ -246,7 +260,6 @@ export class RegisterRequestService {
     const { requestId } = input
     const useCount = Number(input.useCount ?? 0)
     if (!requestId) throw new BadRequestException('requestId wajib diisi')
-    // allow >= 0
     if (!Number.isInteger(useCount) || useCount < 0) throw new BadRequestException('useCount harus bilangan ≥ 0')
 
     const result = await this.prisma.$transaction(async (tx: any) => {
@@ -266,7 +279,7 @@ export class RegisterRequestService {
       let donated = 0
       let allocated = 0
 
-      // === Jalur cepat: confirm tanpa tiket (useCount === 0)
+      // useCount === 0: confirm tanpa tiket + DONATE semua sisa untuk MASTER
       if (useCount === 0) {
         if (source === 'MASTER') {
           const mu = await this.prisma.masterUser.findUnique({ where: { email } })
@@ -287,7 +300,6 @@ export class RegisterRequestService {
             donated = remaining
           }
         }
-        // Tandai request selesai tanpa membuat tiket
         await tx.$executeRawUnsafe(
           `UPDATE "RegistrationRequest" SET "status" = 'CONFIRMED', "updatedAt" = NOW() WHERE "id" = $1;`,
           requestId
@@ -296,7 +308,7 @@ export class RegisterRequestService {
         return { eventId, email, tickets: [] as any[], donated, allocated, poolAfter, requestId }
       }
 
-      // === Jalur normal: useCount > 0
+      // useCount > 0: jalur normal
       if (source === 'MASTER') {
         const mu = await this.prisma.masterUser.findUnique({ where: { email } })
         if (!mu) throw new BadRequestException('Email bukan MASTER saat dikonfirmasi')
