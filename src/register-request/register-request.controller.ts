@@ -60,18 +60,55 @@ export class RegisterRequestController {
   }
 
   @Get('tickets')
-  async tickets(
-    @Query('eventId') eventId?: string,
-    @Query('status') status?: 'QUEUED'|'CALLED'|'IN_PROCESS'|'DONE'|'DEFERRED'|'NO_SHOW'|'ALL',
-    @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
-  ) {
-    if (!eventId) return { ok: false, error: 'eventId wajib diisi' }
-    return this.svc.listTickets({
-      eventId,
-      status: (status as any) ?? 'QUEUED',
-      limit: limit ? Number(limit) : undefined,
-      offset: offset ? Number(offset) : undefined,
-    })
+async tickets(
+  @Query('eventId') eventId?: string,
+  @Query('status') status?: 'QUEUED'|'CALLED'|'IN_PROCESS'|'DONE'|'DEFERRED'|'NO_SHOW'|'ALL',
+  @Query('limit') limit?: string,
+  @Query('offset') offset?: string,
+  @Query('email') email?: string, // ← NEW
+) {
+  if (!eventId) return { ok: false, error: 'eventId wajib diisi' }
+
+  // siapkan filter dasar
+  const args: any[] = [eventId]
+  let whereSql = `"eventId" = $1`
+
+  if ((status as any) && status !== 'ALL') {
+    args.push(status)
+    whereSql += ` AND "status"::text = $${args.length}`
   }
+
+  if (email && email.trim()) {
+    args.push(email.trim().toLowerCase())
+    whereSql += ` AND lower("email") = $${args.length}` // ← filter by email
+  }
+
+  const lim = Math.max(1, Math.min(Number(limit ?? 100), 500))
+  const off = Math.max(0, Number(offset ?? 0))
+
+  const rows = await (this.svc as any).prisma.$queryRawUnsafe(
+    `SELECT "code","order","status","email","name","wa","createdAt"
+     FROM "Ticket"
+     WHERE ${whereSql}
+     ORDER BY "order" ASC
+     LIMIT $${args.length + 1} OFFSET $${args.length + 2};`,
+    ...args, lim, off
+  ) as Array<{ code: string; order: number; status: string; email: string | null; name: string | null; wa: string | null; createdAt: Date }>
+
+  const totalRow = await (this.svc as any).prisma.$queryRawUnsafe(
+    `SELECT COUNT(*)::int AS count FROM "Ticket" WHERE ${whereSql};`,
+    ...args
+  ) as Array<{ count: number }>
+
+  return {
+    ok: true,
+    eventId,
+    status: (status as any) ?? 'QUEUED',
+    limit: lim,
+    offset: off,
+    total: totalRow?.[0]?.count ?? rows.length,
+    items: rows
+  }
+}
+
 }
