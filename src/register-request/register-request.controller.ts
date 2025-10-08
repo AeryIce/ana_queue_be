@@ -21,14 +21,16 @@ export class RegisterRequestController {
     return this.svc.listQueue({ eventId, status: (status as any) ?? 'PENDING' })
   }
 
-  @Post('register-confirm')
+ @Post('register-confirm')
   async confirm(@Body() body: { requestId?: string; useCount?: number }) {
     if (!body?.requestId) return { ok: false, error: 'requestId wajib diisi' }
-    if (!Number.isInteger(body?.useCount) || (body?.useCount as number) <= 0) {
-      return { ok: false, error: 'useCount harus bilangan > 0' }
+    // izinkan >= 0
+    if (!Number.isInteger(body?.useCount) || (body?.useCount as number) < 0) {
+      return { ok: false, error: 'useCount harus bilangan ≥ 0' }
     }
     return this.svc.confirm({ requestId: body.requestId, useCount: Number(body.useCount) })
   }
+
 
   @Get('pool')
   async getPool(@Query('eventId') eventId?: string) {

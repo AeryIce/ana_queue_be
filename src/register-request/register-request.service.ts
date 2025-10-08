@@ -4,10 +4,6 @@ import { PrismaService } from '../prisma.service'
 
 type Source = 'MASTER' | 'WALKIN' | 'GIMMICK'
 
-const PERIPLUS_URL =
-  process.env.PERIPLUS_URL ||
-  'https://www.periplus.com/index.php?route=product/category&sar=1&author=Huang,%20Ana'
-
 @NestInjectable()
 export class RegisterRequestService {
   constructor(private readonly prisma: PrismaService) {}
@@ -43,12 +39,11 @@ export class RegisterRequestService {
     const wa = input.wa?.trim() ?? null
     let source: Source = input.source === 'GIMMICK' ? 'GIMMICK' : 'MASTER'
 
-    // Cek RegistrationRequest aktif (PENDING/CONFIRMED)
     const existing = await this.prisma.$queryRawUnsafe(
       `SELECT "id","eventId","email","name","wa","source","status",
               "isMasterMatch","masterQuota","issuedBefore","createdAt"
        FROM "RegistrationRequest"
-       WHERE "eventId" = $1 AND "email" = $2 AND "status"::text IN ('PENDING','CONFIRMED')
+       WHERE "eventId" = $1 AND "email" = $2 AND "status" = 'PENDING'
        LIMIT 1;`,
       eventId, email
     ) as Array<{
@@ -58,38 +53,20 @@ export class RegisterRequestService {
       createdAt: Date;
     }>
 
-    if (existing.length > 0) {
-      // Blokir: sudah terdaftar pada event ini
-      return {
-        ok: false,
-        code: 'ALREADY_REGISTERED',
-        message: 'Email ini sudah terdaftar pada event ini.',
-        next: { label: 'Lihat buku Ana Huang', url: PERIPLUS_URL }
-      }
-    }
-
-    // Cek Ticket aktif (status != DONE/CANCELLED)
-    const activeTicket = await this.prisma.$queryRawUnsafe(
-      `SELECT 1
-         FROM "Ticket"
-        WHERE "eventId" = $1
-          AND "email" = $2
-          AND "status"::text NOT IN ('DONE','CANCELLED')
-        LIMIT 1;`,
-      eventId, email
-    ) as Array<any>
-
-    if (activeTicket.length > 0) {
-      // Blokir: sudah punya tiket aktif
-      return {
-        ok: false,
-        code: 'ALREADY_REGISTERED',
-        message: 'Email ini sudah memiliki tiket aktif pada event ini.',
-        next: { label: 'Lihat buku Ana Huang', url: PERIPLUS_URL }
-      }
-    }
-
     const poolRemainingBefore = await this.getPoolRemaining(eventId)
+
+    if (existing.length > 0) {
+      const it = existing[0]
+      const masterQuota0 = it.masterQuota ?? 0
+      const issuedBefore0 = it.issuedBefore ?? 0
+      const quotaRemaining0 = Math.max(0, masterQuota0 - issuedBefore0)
+      return {
+        ok: true,
+        dedup: true,
+        request: { ...it, quotaRemaining: quotaRemaining0 },
+        poolRemaining: poolRemainingBefore
+      }
+    }
 
     const mu = await this.prisma.masterUser.findUnique({ where: { email } })
     if (!mu) source = input.source === 'GIMMICK' ? 'GIMMICK' : 'WALKIN'
@@ -160,7 +137,6 @@ export class RegisterRequestService {
     const poolRemaining = await this.getPoolRemaining(eventId)
     return { ok: true, eventId, status, poolRemaining, items }
   }
-
 
   async listRegistrants(params: {
     eventId: string
@@ -270,7 +246,8 @@ export class RegisterRequestService {
     const { requestId } = input
     const useCount = Number(input.useCount ?? 0)
     if (!requestId) throw new BadRequestException('requestId wajib diisi')
-    if (!Number.isInteger(useCount) || useCount <= 0) throw new BadRequestException('useCount harus bilangan > 0')
+    // allow >= 0
+    if (!Number.isInteger(useCount) || useCount < 0) throw new BadRequestException('useCount harus bilangan ≥ 0')
 
     const result = await this.prisma.$transaction(async (tx: any) => {
       const reqRows = await tx.$queryRawUnsafe(
@@ -289,6 +266,37 @@ export class RegisterRequestService {
       let donated = 0
       let allocated = 0
 
+      // === Jalur cepat: confirm tanpa tiket (useCount === 0)
+      if (useCount === 0) {
+        if (source === 'MASTER') {
+          const mu = await this.prisma.masterUser.findUnique({ where: { email } })
+          if (!mu) throw new BadRequestException('Email bukan MASTER saat dikonfirmasi')
+
+          const issuedRow = await tx.$queryRawUnsafe(
+            'SELECT COUNT(*)::int AS count FROM "Ticket" WHERE "eventId" = $1 AND "email" = $2;',
+            eventId, email
+          ) as Array<{ count: number }>
+          const issued = issuedRow?.[0]?.count ?? 0
+          const remaining = mu.quota - issued
+          if (remaining > 0) {
+            await tx.$executeRawUnsafe(
+              `INSERT INTO "SurplusLedger" ("id","eventId","type","email","amount","refRequestId","createdAt")
+               VALUES ($1,$2,'DONATE',$3,$4,$5,NOW());`,
+              randomUUID(), eventId, email, remaining, requestId
+            )
+            donated = remaining
+          }
+        }
+        // Tandai request selesai tanpa membuat tiket
+        await tx.$executeRawUnsafe(
+          `UPDATE "RegistrationRequest" SET "status" = 'CONFIRMED', "updatedAt" = NOW() WHERE "id" = $1;`,
+          requestId
+        )
+        const poolAfter = await this.getPoolRemainingTx(tx, eventId)
+        return { eventId, email, tickets: [] as any[], donated, allocated, poolAfter, requestId }
+      }
+
+      // === Jalur normal: useCount > 0
       if (source === 'MASTER') {
         const mu = await this.prisma.masterUser.findUnique({ where: { email } })
         if (!mu) throw new BadRequestException('Email bukan MASTER saat dikonfirmasi')
