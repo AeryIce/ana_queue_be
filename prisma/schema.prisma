@@ -11,10 +11,16 @@ datasource db {
  * ===== ENUM =====
  */
 enum TicketStatus {
+  // Baru (Team B)
+  CONFIRMED
   QUEUED
+  ACTIVE
+  DONE
+  CANCELLED
+
+  // Lama (biarkan dulu supaya tidak di-drop)
   CALLED
   IN_PROCESS
-  DONE
   DEFERRED
   NO_SHOW
 }
@@ -23,7 +29,7 @@ enum TicketStatus {
  * ===== MODELS =====
  */
 model Event {
-  id           String         @id @default(uuid())
+  id           String         @id @default(cuid())
   name         String
   startsAt     DateTime?
   endsAt       DateTime?
@@ -34,23 +40,46 @@ model Event {
 }
 
 model Ticket {
-  id        String       @id @default(uuid())
-  code      String       @unique // contoh: AH-101
-  name      String
-  status    TicketStatus @default(QUEUED)
-  order     Int
-  eventId   String
-  event     Event        @relation(fields: [eventId], references: [id])
-  callLogs  CallLog[]
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
+  id      String @id @default(cuid())
+  eventId String
+  event   Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
 
-  // NEW (nullable dulu agar migrasi aman ke data lama)
-  email String? // lowercase, untuk kuota per email
-  wa    String? // opsional
+  code  String?
+  email String?
+  name  String?
 
-  @@index([eventId, status, order])
-  @@index([eventId, email])
+  status TicketStatus @default(CONFIRMED)
+
+  // Queue (per batch 6)
+  batchNo    Int?
+  posInBatch Int?
+
+  // Active (slot 1..6)
+  slotNo Int?
+
+  // Skip Grid
+  isSkipped Boolean   @default(false)
+  skippedAt DateTime?
+
+  // Auto "IN PROCESS"
+  inProcess    Boolean   @default(false)
+  inProcessAt  DateTime?
+  processingMs BigInt?
+  confirmedAt  DateTime?
+
+  // Field legacy (biarkan agar tidak di-drop)
+  wa    String?
+  order Int?
+
+  callLogs CallLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId, status], name: "Ticket_eventId_status_idx")
+  @@index([eventId, batchNo, posInBatch], name: "Ticket_eventId_batchNo_posInBatch_idx")
+  @@index([eventId, slotNo], name: "Ticket_eventId_slotNo_idx")
+  @@index([eventId, isSkipped, status], name: "Ticket_eventId_isSkipped_status_idx")
 }
 
 model Counter {
@@ -62,14 +91,16 @@ model Counter {
 }
 
 model CallLog {
-  id        String   @id @default(uuid())
-  ticketId  String
-  counterId String
-  calledAt  DateTime @default(now())
-  note      String?
+  id       String @id @default(cuid())
+  ticketId String
+  ticket   Ticket @relation(fields: [ticketId], references: [id])
 
-  ticket  Ticket  @relation(fields: [ticketId], references: [id])
-  counter Counter @relation(fields: [counterId], references: [id])
+  counterId String?
+  // legacy (jangan dihapus dulu)
+  calledAt  DateTime?
+  // baru (kalau sudah ada, biarkan saja)
+  createdAt DateTime  @default(now())
+  Counter   Counter?  @relation(fields: [counterId], references: [id])
 }
 
 model MasterUser {

@@ -1,4 +1,13 @@
-import { Controller, Get, Patch, Param, Body, NotFoundException, BadRequestException, Query } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Patch,
+  Param,
+  Body,
+  NotFoundException,
+  BadRequestException,
+  Query,
+} from '@nestjs/common';
 import { PrismaService } from './prisma.service';
 import { TicketStatus } from '@prisma/client';
 
@@ -37,18 +46,25 @@ export class AppController {
     return { eventId, active, next };
   }
 
-  // ---- Aksi Admin ----
+  // ---- Aksi Admin (legacy) ----
+  // Catatan:
+  // - ganti semua findUnique({ where: { code } }) -> findFirst({ where: { code } })
+  //   karena 'code' sekarang non-unique
+  // - kolom CallLog.note sudah di-drop
 
   // 1) CALL: QUEUED/DEFERRED -> CALLED + log panggilan
   @Patch('api/tickets/:code/call')
   async callTicket(
     @Param('code') code: string,
-    @Body() body: { counterName?: string; note?: string } = {},
+    @Body() body: { counterName?: string } = {},
   ) {
-    const ticket = await this.prisma.ticket.findUnique({ where: { code } });
+    const ticket = await this.prisma.ticket.findFirst({ where: { code } });
     if (!ticket) throw new NotFoundException('Ticket not found');
 
-    if (ticket.status !== TicketStatus.QUEUED && ticket.status !== TicketStatus.DEFERRED) {
+    if (
+      ticket.status !== TicketStatus.QUEUED &&
+      ticket.status !== TicketStatus.DEFERRED
+    ) {
       throw new BadRequestException(`Cannot CALL from status ${ticket.status}`);
     }
 
@@ -63,14 +79,22 @@ export class AppController {
     const updated = await this.prisma.ticket.update({
       where: { id: ticket.id },
       data: { status: TicketStatus.CALLED },
-      select: { id: true, code: true, name: true, status: true, order: true, eventId: true },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        status: true,
+        order: true,
+        eventId: true,
+      },
     });
 
     await this.prisma.callLog.create({
       data: {
         ticketId: updated.id,
         counterId: counter.id,
-        note: body.note,
+        // note: (DIHAPUS - kolom sudah tidak ada)
+        calledAt: new Date(), // opsional, kolom ini nullable
       },
     });
 
@@ -80,7 +104,10 @@ export class AppController {
   // 2) IN-PROCESS: CALLED -> IN_PROCESS
   @Patch('api/tickets/:code/in-process')
   async inProcess(@Param('code') code: string) {
-    const t = await this.prisma.ticket.findUnique({ where: { code }, select: { id: true, status: true } });
+    const t = await this.prisma.ticket.findFirst({
+      where: { code },
+      select: { id: true, status: true },
+    });
     if (!t) throw new NotFoundException('Ticket not found');
     if (t.status !== TicketStatus.CALLED) {
       throw new BadRequestException(`Cannot set IN_PROCESS from ${t.status}`);
@@ -95,9 +122,15 @@ export class AppController {
   // 3) DONE: IN_PROCESS/CALLED -> DONE
   @Patch('api/tickets/:code/done')
   async done(@Param('code') code: string) {
-    const t = await this.prisma.ticket.findUnique({ where: { code }, select: { id: true, status: true } });
+    const t = await this.prisma.ticket.findFirst({
+      where: { code },
+      select: { id: true, status: true },
+    });
     if (!t) throw new NotFoundException('Ticket not found');
-    if (t.status !== TicketStatus.IN_PROCESS && t.status !== TicketStatus.CALLED) {
+    if (
+      t.status !== TicketStatus.IN_PROCESS &&
+      t.status !== TicketStatus.CALLED
+    ) {
       throw new BadRequestException(`Cannot set DONE from ${t.status}`);
     }
     const updated = await this.prisma.ticket.update({
@@ -110,7 +143,7 @@ export class AppController {
   // 4) SKIP: CALLED -> DEFERRED dan dorong ke belakang antrean (order max+1)
   @Patch('api/tickets/:code/skip')
   async skip(@Param('code') code: string) {
-    const t = await this.prisma.ticket.findUnique({
+    const t = await this.prisma.ticket.findFirst({
       where: { code },
       select: { id: true, status: true, eventId: true },
     });
@@ -130,17 +163,29 @@ export class AppController {
       data: { status: TicketStatus.DEFERRED, order: newOrder },
     });
     return { ok: true, ticket: updated };
-  };
+  }
+
+  // Board sederhana (legacy)
   @Get('api/board')
   async board(@Query('eventId') eventId = 'seed-event') {
     const active = await this.prisma.ticket.findMany({
-      where: { eventId, status: { in: [TicketStatus.IN_PROCESS, TicketStatus.CALLED] } },
+      where: {
+        eventId,
+        status: { in: [TicketStatus.IN_PROCESS, TicketStatus.CALLED] },
+      },
       orderBy: [
-        { status: 'desc' },     // enum sort: "IN_PROCESS" > "CALLED"
-        { updatedAt: 'asc' },   // yang dipanggil lebih dulu tampil duluan
+        { status: 'desc' }, // enum sort: IN_PROCESS > CALLED
+        { updatedAt: 'asc' },
       ],
       take: 5,
-      select: { id: true, code: true, name: true, status: true, order: true, updatedAt: true },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        status: true,
+        order: true,
+        updatedAt: true,
+      },
     });
 
     const next = await this.prisma.ticket.findMany({
@@ -151,5 +196,5 @@ export class AppController {
     });
 
     return { eventId, active, next };
-}
+  }
 }
