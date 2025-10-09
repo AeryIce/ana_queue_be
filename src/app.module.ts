@@ -2,23 +2,21 @@ import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
-// Team B
+import { PrismaModule } from './prisma.module';                // <<< global prisma
 import { QueueModule } from './queue/queue.module';
-
-// >>> Tambahkan dua module ini supaya route lama aktif lagi
 import { RegisterModule } from './register/register.module';
 import { RegisterRequestModule } from './register-request/register-request.module';
-
-// Prisma dipakai AppController (dan aman kalau dibutuhkan module lain)
-import { PrismaService } from './prisma.service';
+import { LegacyModule } from './legacy/legacy.module';
 
 @Module({
   imports: [
+    PrismaModule,          // <<< penting: jadikan PrismaService global
     QueueModule,
-    RegisterModule,           // <<< penting
-    RegisterRequestModule,    // <<< penting
+    RegisterModule,
+    RegisterRequestModule,
+    LegacyModule,
   ],
   controllers: [AppController],
-  providers: [AppService, PrismaService],
+  providers: [AppService], // PrismaService tak perlu lagi di sini
 })
 export class AppModule {}
