@@ -44,8 +44,12 @@ export class RegisterRequestController {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
     // sanitasi & batas wajar
-    const limitNum = Number.isFinite(Number(limitStr)) ? Math.max(0, Math.min(100, parseInt(String(limitStr), 10))) : 10;
-    const offsetNum = Number.isFinite(Number(offsetStr)) ? Math.max(0, parseInt(String(offsetStr), 10)) : 0;
+    const limitNum = Number.isFinite(Number(limitStr))
+      ? Math.max(0, Math.min(100, parseInt(String(limitStr), 10)))
+      : 10;
+    const offsetNum = Number.isFinite(Number(offsetStr))
+      ? Math.max(0, parseInt(String(offsetStr), 10))
+      : 0;
 
     return this.svc.listRegistrants({
       eventId,
@@ -55,5 +59,29 @@ export class RegisterRequestController {
       offset: offsetNum,
       q: q?.trim() || undefined,
     });
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // POST /api/register-confirm
+  // Catatan penting:
+  //  - IZINKAN useCount = 0 untuk skenario "donate all" (sesuai journey lama)
+  //  - Valid < 0 tetap ditolak.
+  //  - requestId wajib.
+  // ─────────────────────────────────────────────────────────
+  @Post('register-confirm')
+  async confirm(@Body() body: { requestId?: string; useCount?: number }) {
+    const reqId = body?.requestId;
+    const num = Number(body?.useCount ?? 0);
+
+    if (!reqId) {
+      return { ok: false, error: 'requestId wajib diisi' };
+    }
+
+    // IZINKAN 0 → donate all; larang nilai negatif / bukan bilangan bulat
+    if (!Number.isInteger(num) || num < 0) {
+      return { ok: false, error: 'useCount harus bilangan >= 0' };
+    }
+
+    return this.svc.confirm({ requestId: reqId, useCount: num });
   }
 }

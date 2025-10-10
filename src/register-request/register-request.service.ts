@@ -167,6 +167,7 @@ export class RegisterRequestService {
         masterQuota: true,
         issuedBefore: true,
         createdAt: true,
+        updatedAt: true,
       },
     });
 
@@ -178,12 +179,12 @@ export class RegisterRequestService {
         eventId: req.eventId,
         email: req.email,
         name: req.name ?? name,
-        wa: (req.wa as string | null) ?? wa,
+        wa: (req.wa as string | null) ?? null,
         source: req.source as Source,
         status: req.status as ReqStatus,
         isMasterMatch: typeof req.isMasterMatch === 'boolean' ? req.isMasterMatch : isMasterMatch,
-        masterQuota: typeof req.masterQuota === 'number' ? req.masterQuota : masterQuota,
-        issuedBefore: typeof req.issuedBefore === 'number' ? req.issuedBefore : issuedBefore,
+        masterQuota: typeof req.masterQuota === 'number' ? req.masterQuota : null,
+        issuedBefore: typeof req.issuedBefore === 'number' ? req.issuedBefore : null,
       },
     };
   }
