@@ -94,86 +94,103 @@ export class RegisterService {
     }
   }
 
-  // === NEW: Approve → terbitkan 1 tiket CONFIRMED + code AH-xxx ===
- // === REPLACE WHOLE confirm() METHOD ===
-async confirm(input: { eventId: string; requestId?: string; email?: string; source: 'MASTER'|'WALKIN'|'GIMMICK' }) {
-  const { eventId, requestId, email, source } = input
-  if (!eventId) throw new BadRequestException('eventId required')
-  if (!requestId && !email) throw new BadRequestException('requestId or email required')
+  // === LEGACY-COMPAT: Approve → keluarkan tiket tanpa sentuh kolom batch ===
+  async confirm(input: {
+    eventId?: string;                 // optional: fallback ke eventId milik request PENDING
+    requestId?: string;
+    email?: string;                   // fallback kalau tak pakai requestId
+    source?: 'MASTER'|'WALKIN'|'GIMMICK';
+    useCount?: number;                // legacy support; default 1
+  }) {
+    const useCount = Math.max(1, Math.min(Number(input.useCount ?? 1), 10)) // batasi 1..10
+    const reqId = input.requestId?.trim()
+    const emailLower = input.email?.trim().toLowerCase()
 
-  return this.prisma.$transaction(async (tx) => {
-    // 1) Cari PENDING
-    const req = await tx.registrationRequest.findFirst({
-      where: {
-        eventId,
-        status: 'PENDING',
-        ...(requestId ? { id: requestId } : {}),
-        ...(email ? { email: email.toLowerCase() } : {}),
-      },
-    })
-    if (!req) throw new NotFoundException('Pending request not found')
+    return this.prisma.$transaction(async (tx) => {
+      // 1) Ambil PENDING request (prioritas by requestId; kalau tidak ada, pakai email+eventId)
+      const req = await tx.registrationRequest.findFirst({
+        where: {
+          status: 'PENDING',
+          ...(reqId ? { id: reqId } : {}),
+          ...(!reqId && input.eventId && emailLower ? { eventId: input.eventId, email: emailLower } : {}),
+        },
+      })
+      if (!req) throw new NotFoundException('Pending request not found')
 
-    // 2) Idempotensi: sudah punya tiket aktif?
-    const existing = await tx.ticket.findFirst({
-      where: { eventId, email: req.email, status: { in: ['QUEUED','ACTIVE','CONFIRMED'] } },
-    })
-    if (existing) {
+      const eventId = input.eventId ?? req.eventId
+      const name = req.name ?? ''
+      const email = req.email
+
+      // 2) Cek sudah punya tiket aktif/berjalan? (RAW supaya tidak menyentuh kolom batch)
+      const existRows = await tx.$queryRaw<Array<{ code: string; status: string }>>`
+        SELECT "code", "status"::text AS status
+        FROM "Ticket"
+        WHERE "eventId" = ${eventId}
+          AND "email" = ${email}
+          AND "status"::text IN ('QUEUED','CALLED','IN_PROCESS','ACTIVE','CONFIRMED')
+        ORDER BY "order" ASC
+        LIMIT 1;
+      `
+      if (existRows.length > 0) {
+        const ex = existRows[0]
+        return { ok: true, ticket: { code: ex.code, status: ex.status, name, email }, note: 'already_has_ticket' }
+      }
+
+      // 3) Ambil blok nomor dari counter (RAW)
+      const inc = await tx.$queryRaw<Array<{ nextOrder: number }>>`
+        UPDATE "queue_counters"
+        SET "nextOrder" = "nextOrder" + ${useCount}
+        WHERE "eventId" = ${eventId}
+        RETURNING "nextOrder";
+      `
+      if (!inc?.[0]?.nextOrder) throw new BadRequestException('QueueCounter belum di-seed untuk event ini')
+
+      const nextOrder = Number(inc[0].nextOrder)
+      const startOrder = nextOrder - useCount
+      const endOrder = nextOrder - 1
+
+      // 4) Insert tiket (RAW, tanpa kolom batch/slot). Status aman: 'QUEUED'.
+      const createdCodes: string[] = []
+      for (let i = 0; i < useCount; i++) {
+        const order = startOrder + i
+        const code = `AH-${order.toString().padStart(3,'0')}`
+        createdCodes.push(code)
+
+        await tx.$executeRawUnsafe(
+          `
+          INSERT INTO "Ticket" ("eventId","code","order","status","name","email")
+          VALUES ($1,$2,$3,$4,$5,$6)
+          ON CONFLICT ("eventId","code") DO NOTHING
+          `,
+          eventId, code, order, 'QUEUED', name, email
+        )
+      }
+
+      // 5) Update request -> CONFIRMED
+      await tx.registrationRequest.update({
+        where: { id: req.id },
+        data: { status: 'CONFIRMED' },
+      })
+
+      // 6) Ledger pool (opsional) — aman kalau tabel ada; di-skip jika error
+      try {
+        if (input.source && input.source !== 'MASTER') {
+          await tx.$executeRawUnsafe(
+            `INSERT INTO "SurplusLedger" ("eventId","type","amount") VALUES ($1,$2,$3)`,
+            eventId, 'ALLOCATE', useCount
+          )
+        }
+      } catch {
+        // jangan hentikan flow approve kalau ledger tidak ada
+      }
+
+      const firstCode = createdCodes[0]
       return {
         ok: true,
-        ticket: { code: existing.code, status: existing.status, name: existing.name, email: existing.email },
-        note: 'already_has_ticket',
+        ticket: { code: firstCode, status: 'QUEUED', name, email },
+        allocatedRange: { from: startOrder, to: endOrder },
+        count: createdCodes.length,
       }
-    }
-
-    // 3) Ambil 1 nomor dari queue_counters
-    const inc = await tx.$queryRaw<Array<{ nextOrder: number }>>`
-      UPDATE "queue_counters"
-      SET "nextOrder" = "nextOrder" + 1
-      WHERE "eventId" = ${eventId}
-      RETURNING "nextOrder";
-    `
-    if (!inc?.[0]?.nextOrder) throw new Error('QueueCounter belum di-seed untuk event ini')
-
-    const order = inc[0].nextOrder - 1
-    const code = `AH-${order.toString().padStart(3,'0')}`
-
-    // 4) Buat tiket (tanpa field 'source' & 'confirmedAt' jika memang tidak ada di schema)
-    const t = await tx.ticket.create({
-      data: {
-        eventId,
-        code,
-        order,
-        status: 'CONFIRMED',     // jika enum ini tidak ada di schema, ganti ke status yang ada (mis. 'QUEUED')
-        name: req.name ?? '',
-        email: req.email,
-        // HAPUS: source, confirmedAt (tidak ada di schema kamu)
-      } as any, // <-- jaga-jaga perbedaan tipe enum Prisma; boleh dihapus kalau sudah nyocok
     })
-
-    // 5) Update request → CONFIRMED
-    await tx.registrationRequest.update({
-      where: { id: req.id },
-      data: { status: 'CONFIRMED' },
-    })
-
-    // 6) Ledger pool (opsional): ALLOCATE 1 untuk non-MASTER
-    try {
-      if (source !== 'MASTER') {
-        await tx.surplusLedger.create({
-          data: {
-            eventId,
-            type: 'ALLOCATE',
-            amount: 1,
-            // HAPUS: note (tidak ada di schema kamu)
-          } as any,
-        })
-      }
-    } catch {
-      // kalau tabel ledger belum ada / enum beda → jangan bikin 500
-    }
-
-    return { ok: true, ticket: { code, status: t.status, name: t.name, email: t.email } }
-  })
-}
-
+  }
 }
