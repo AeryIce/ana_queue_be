@@ -114,6 +114,12 @@ export class QueueService {
     });
   }
 
+  // === KOMPAT LEGACY: dipanggil oleh legacy.controller.ts ===
+  async callNextBatch(eventId: string) {
+    // untuk schema lama, cukup promosikan head of queue ke ACTIVE
+    return this.promoteQueueToActive(eventId);
+  }
+
   // Skip ACTIVE -> balik QUEUED (ke ekor: kita pakai order besar saja biar di akhir)
   async skipActive(eventId: string, id: string) {
     return this.prisma.$transaction(async (tx) => {
