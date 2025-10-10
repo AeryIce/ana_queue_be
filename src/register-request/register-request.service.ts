@@ -1,137 +1,133 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 
+type Source = 'MASTER' | 'WALKIN' | 'GIMMICK';
+type ReqStatus = 'PENDING' | 'CONFIRMED' | 'CANCELLED';
+
+export interface ReqResp {
+  ok?: boolean;
+  dedup?: boolean;
+  alreadyRegistered?: boolean;
+  request?: {
+    id: string;
+    eventId: string;
+    email: string;
+    name: string;
+    wa: string | null;
+    source: Source;
+    status: ReqStatus;
+    isMasterMatch?: boolean | null;
+  };
+  poolRemaining?: number;
+  error?: string;
+  message?: string;
+}
+
 @Injectable()
 export class RegisterRequestService {
   constructor(private readonly prisma: PrismaService) {}
 
-  // Ambil satu request berdasarkan id
-  async findById(id: string) {
-    // Jika tabel RegistrationRequest ada:
-    try {
-      return await this.prisma.registrationRequest.findUnique({
-        where: { id },
-        select: {
-          id: true,
-          email: true,
-          name: true,
-          eventId: true,
-          status: true,
-          createdAt: true,
-          source: true,
+  async createRequest(input: { eventId: string; email: string; name: string; wa?: string }): Promise<ReqResp> {
+    const eventId = String(input.eventId);
+    const email = String(input.email).toLowerCase().trim();
+    const name = String(input.name).trim();
+    const wa = input.wa ? String(input.wa).trim() : null;
+
+    // Pastikan event ada (hindari FK error gelap)
+    const ev = await this.prisma.event.findUnique({ where: { id: eventId } });
+    if (!ev) {
+      return { ok: false, message: 'Event tidak ditemukan' };
+    }
+
+    // Cek apakah email MASTER (untuk flag isMasterMatch & source)
+    const mu = await this.prisma.masterUser.findUnique({
+      where: { email: email },
+      select: { email: true },
+    });
+    const isMasterMatch = !!mu;
+    const source: Source = isMasterMatch ? 'MASTER' : 'WALKIN';
+
+    // Cek apakah SUDAH CONFIRMED (sudah punya tiket) → dianggap alreadyRegistered
+    const alreadyTicket = await this.prisma.ticket.findFirst({
+      where: { eventId, email: email },
+      select: { id: true },
+    });
+    if (alreadyTicket) {
+      return {
+        ok: true,
+        alreadyRegistered: true,
+        request: {
+          id: '', // tidak relevan (sudah confirmed)
+          eventId,
+          email,
+          name,
+          wa,
+          source,
+          status: 'CONFIRMED',
+          isMasterMatch,
         },
-      });
-    } catch {
-      // Fallback: kalau tabel belum ada, treat id sebagai email dan cek masterUser
-      const mu = await this.prisma.masterUser.findUnique({
-        where: { email: id },
-        select: { email: true, firstName: true, lastName: true },
-      });
-      return mu
-        ? {
-            id,
-            email: mu.email,
-            name: `${mu.firstName ?? ''} ${mu.lastName ?? ''}`.trim(),
-            eventId: '',
-            status: 'PENDING',
-            createdAt: new Date(),
-            source: 'MASTER',
-          }
-        : null;
+      };
     }
-  }
 
-  // List request pending (support filter dasar)
-  async list(params: {
-    eventId?: string;
-    status?: string;
-    limit?: number;
-    offset?: number;
-    q?: string;
-    source?: string;
-  }) {
-    const {
-      eventId,
-      status = 'PENDING',
-      limit = 20,
-      offset = 0,
-      q = '',
-      source = '',
-    } = params;
-
-    // Coba pakai tabel RegistrationRequest
-    try {
-      const where: Record<string, unknown> = {};
-      if (eventId) (where as any).eventId = eventId;
-      if (status && status !== 'ALL') (where as any).status = status;
-      if (source && source !== 'ALL') (where as any).source = source;
-      if (q) {
-        (where as any).OR = [
-          { email: { contains: q, mode: 'insensitive' } },
-          { name: { contains: q, mode: 'insensitive' } },
-        ];
-      }
-
-      const [items, total] = await Promise.all([
-        this.prisma.registrationRequest.findMany({
-          where,
-          skip: offset,
-          take: limit,
-          orderBy: { createdAt: 'desc' },
-          select: {
-            id: true,
-            email: true,
-            name: true,
-            eventId: true,
-            status: true,
-            createdAt: true,
-            source: true,
-            masterQuota: true,
-            issuedBefore: true,
-          },
-        }),
-        this.prisma.registrationRequest.count({ where }),
-      ]);
-
-      return { ok: true, items, total };
-    } catch {
-      // Fallback: kalau tabel belum ada → gunakan masterUser sebagai dummy PENDING
-      const users = await this.prisma.masterUser.findMany({
-        skip: offset,
-        take: limit,
-        select: {
-          email: true,
-          firstName: true,
-          lastName: true,
-          quota: true,
+    // Cek dedup PENDING di RegistrationRequest
+    const existingPending = await this.prisma.registrationRequest.findFirst({
+      where: { eventId, email, status: 'PENDING' },
+      select: { id: true, name: true, wa: true, source: true, isMasterMatch: true, createdAt: true },
+    });
+    if (existingPending) {
+      return {
+        ok: true,
+        dedup: true,
+        request: {
+          id: existingPending.id,
+          eventId,
+          email,
+          name: existingPending.name ?? name,
+          wa: (existingPending.wa as string | null) ?? wa,
+          source: (existingPending.source as Source) ?? source,
+          status: 'PENDING',
+          isMasterMatch: typeof existingPending.isMasterMatch === 'boolean' ? existingPending.isMasterMatch : isMasterMatch,
         },
-      });
-
-      const items = users.map((u) => ({
-        id: u.email, // pakai email sebagai requestId sementara
-        email: u.email,
-        name: `${u.firstName ?? ''} ${u.lastName ?? ''}`.trim(),
-        eventId: eventId ?? '',
-        status,
-        createdAt: new Date().toISOString(),
-        source: 'MASTER',
-        masterQuota: u.quota,
-        issuedBefore: 0,
-      }));
-
-      return { ok: true, items, total: items.length };
+      };
     }
-  }
 
-  // Tandai CONFIRMED (no-op jika tabel belum ada)
-  async markConfirmed(id: string) {
-    try {
-      await this.prisma.registrationRequest.update({
-        where: { id },
-        data: { status: 'CONFIRMED' },
-      });
-    } catch {
-      // ignore; fallback mode
-    }
+    // Buat PENDING baru di RegistrationRequest (TANPA membuat Ticket)
+    const req = await this.prisma.registrationRequest.create({
+      data: {
+        eventId,
+        email,
+        name,
+        wa,
+        source,
+        status: 'PENDING',
+        isMasterMatch,
+      },
+      select: {
+        id: true,
+        eventId: true,
+        email: true,
+        name: true,
+        wa: true,
+        source: true,
+        status: true,
+        isMasterMatch: true,
+        createdAt: true,
+      },
+    });
+
+    return {
+      ok: true,
+      dedup: false,
+      request: {
+        id: req.id,
+        eventId: req.eventId,
+        email: req.email,
+        name: req.name ?? name,
+        wa: (req.wa as string | null) ?? wa,
+        source: req.source as Source,
+        status: req.status as ReqStatus,
+        isMasterMatch: typeof req.isMasterMatch === 'boolean' ? req.isMasterMatch : isMasterMatch,
+      },
+    };
   }
 }
