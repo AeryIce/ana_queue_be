@@ -19,6 +19,8 @@ export interface ReqResp {
     source: Source;
     status: ReqStatus;
     isMasterMatch?: boolean | null;
+    masterQuota?: number | null;
+    issuedBefore?: number | null;
   };
   poolRemaining?: number;
   error?: string;
@@ -29,13 +31,28 @@ export interface ReqResp {
 export class RegisterRequestService {
   constructor(private readonly prisma: PrismaService) {}
 
+  /** Utility kecil untuk baca angka dari object dinamis */
+  private readNumericField(obj: unknown, keys: string[]): number | null {
+    if (!obj || typeof obj !== 'object') return null;
+    const rec = obj as Record<string, unknown>;
+    for (const k of keys) {
+      const v = rec[k];
+      if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.floor(v));
+      if (typeof v === 'string' && v.trim().length > 0 && !Number.isNaN(Number(v))) {
+        return Math.max(0, Math.floor(Number(v)));
+      }
+    }
+    return null;
+  }
+
   /**
    * Buat RegistrationRequest (status PENDING), tanpa membuat Ticket.
-   * Menerapkan:
    * - Validasi event
    * - Deteksi master/walkin
-   * - Cek alreadyRegistered (sudah punya tiket → dianggap CONFIRMED)
-   * - Dedup PENDING untuk email+event yang sama
+   * - Ambil masterQuota dari MasterUser.* (toleran nama kolom)
+   * - Hitung issuedBefore = jumlah tiket yang sudah terbit
+   * - Cek alreadyRegistered → CONFIRMED
+   * - Dedup PENDING
    */
   async createRequest(input: { eventId: string; email: string; name: string; wa?: string }): Promise<ReqResp> {
     const eventId = String(input.eventId);
@@ -43,31 +60,32 @@ export class RegisterRequestService {
     const name = String(input.name).trim();
     const wa = input.wa ? String(input.wa).trim() : null;
 
-    // Pastikan event ada (hindari FK error gelap)
+    // pastikan event ada
     const ev = await this.prisma.event.findUnique({ where: { id: eventId } });
-    if (!ev) {
-      return { ok: false, message: 'Event tidak ditemukan' };
-    }
+    if (!ev) return { ok: false, message: 'Event tidak ditemukan' };
 
-    // Cek apakah email MASTER (untuk flag isMasterMatch & source)
-    const mu = await this.prisma.masterUser.findUnique({
-      where: { email: email },
-      select: { email: true },
-    });
-    const isMasterMatch = !!mu;
+    // cek master user & baca quota dengan nama kolom fleksibel
+    const muRaw = await this.prisma.masterUser.findUnique({ where: { email } });
+    const isMasterMatch = !!muRaw;
     const source: Source = isMasterMatch ? 'MASTER' : 'WALKIN';
 
-    // Cek apakah SUDAH CONFIRMED (sudah punya tiket) → dianggap alreadyRegistered
-    const alreadyTicket = await this.prisma.ticket.findFirst({
-      where: { eventId, email: email },
-      select: { id: true },
-    });
-    if (alreadyTicket) {
+    // coba beberapa kemungkinan nama kolom quota
+    // (silakan tambah kalau di DB kamu beda lagi)
+    const masterQuotaFromDB =
+      this.readNumericField(muRaw, ['quota', 'masterQuota', 'maxQuota', 'slots', 'allowance']);
+    // fallback kebijakan event (ubah ke 1 jika perlu)
+    const masterQuota: number | null = isMasterMatch ? (masterQuotaFromDB ?? 2) : null;
+
+    // tiket yang sudah pernah terbit untuk email+event
+    const issuedBefore = await this.prisma.ticket.count({ where: { eventId, email } });
+
+    // jika sudah ada tiket → sudah confirmed
+    if (issuedBefore > 0) {
       return {
         ok: true,
         alreadyRegistered: true,
         request: {
-          id: '', // tidak relevan (sudah confirmed)
+          id: '',
           eventId,
           email,
           name,
@@ -75,11 +93,13 @@ export class RegisterRequestService {
           source,
           status: 'CONFIRMED',
           isMasterMatch,
+          masterQuota,
+          issuedBefore,
         },
       };
     }
 
-    // Cek dedup PENDING di RegistrationRequest
+    // dedup PENDING
     const existingPending = await this.prisma.registrationRequest.findFirst({
       where: { eventId, email, status: 'PENDING' },
       select: {
@@ -88,9 +108,12 @@ export class RegisterRequestService {
         wa: true,
         source: true,
         isMasterMatch: true,
+        masterQuota: true,
+        issuedBefore: true,
         createdAt: true,
       },
     });
+
     if (existingPending) {
       return {
         ok: true,
@@ -104,12 +127,22 @@ export class RegisterRequestService {
           source: (existingPending.source as Source) ?? source,
           status: 'PENDING',
           isMasterMatch:
-            typeof existingPending.isMasterMatch === 'boolean' ? existingPending.isMasterMatch : isMasterMatch,
+            typeof existingPending.isMasterMatch === 'boolean'
+              ? existingPending.isMasterMatch
+              : isMasterMatch,
+          masterQuota:
+            typeof existingPending.masterQuota === 'number'
+              ? existingPending.masterQuota
+              : masterQuota,
+          issuedBefore:
+            typeof existingPending.issuedBefore === 'number'
+              ? existingPending.issuedBefore
+              : issuedBefore,
         },
       };
     }
 
-    // Buat PENDING baru di RegistrationRequest (TANPA membuat Ticket)
+    // buat PENDING baru
     const req = await this.prisma.registrationRequest.create({
       data: {
         eventId,
@@ -119,6 +152,8 @@ export class RegisterRequestService {
         source,
         status: 'PENDING',
         isMasterMatch,
+        masterQuota,   // ⬅️ simpan quota
+        issuedBefore,  // ⬅️ simpan pemakaian sebelumnya
       },
       select: {
         id: true,
@@ -129,6 +164,8 @@ export class RegisterRequestService {
         source: true,
         status: true,
         isMasterMatch: true,
+        masterQuota: true,
+        issuedBefore: true,
         createdAt: true,
       },
     });
@@ -145,15 +182,13 @@ export class RegisterRequestService {
         source: req.source as Source,
         status: req.status as ReqStatus,
         isMasterMatch: typeof req.isMasterMatch === 'boolean' ? req.isMasterMatch : isMasterMatch,
+        masterQuota: typeof req.masterQuota === 'number' ? req.masterQuota : masterQuota,
+        issuedBefore: typeof req.issuedBefore === 'number' ? req.issuedBefore : issuedBefore,
       },
     };
   }
 
-  /**
-   * Listing untuk halaman Admin Approve.
-   * Mendukung filter: eventId, status, source, q, limit, offset
-   * Mengembalikan format FE: { ok, items, total, limit, offset }
-   */
+  /** Listing untuk Admin Approve */
   async listRegistrants(params: {
     eventId: string;
     status: StatusFilter;
@@ -164,7 +199,6 @@ export class RegisterRequestService {
   }) {
     const { eventId, status, source, limit, offset, q } = params;
 
-    // Bentuk where yang ketat tanpa `any`
     const where: {
       eventId: string;
       status?: ReqStatus;
@@ -204,34 +238,38 @@ export class RegisterRequestService {
           source: true,
           status: true,
           isMasterMatch: true,
+          masterQuota: true,
+          issuedBefore: true,
           createdAt: true,
           updatedAt: true,
         },
       }),
     ]);
 
-    // mapping agar cocok dengan pembacaan FE (approve page)
-    const items = rows.map((r) => ({
-      id: r.id,
-      email: r.email,
-      name: r.name ?? null,
-      code: null as string | null, // tiket belum ada di tahap ini
-      firstName: null as string | null,
-      lastName: null as string | null,
-      wa: (r.wa as string | null) ?? null,
-      source: r.source as Source,
-      status: r.status as ReqStatus,
-      isMasterMatch: typeof r.isMasterMatch === 'boolean' ? r.isMasterMatch : null,
-      createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : null,
-      updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : null,
-    }));
+    const items = rows.map((r) => {
+      const quota = typeof r.masterQuota === 'number' ? r.masterQuota : 0;
+      const used = typeof r.issuedBefore === 'number' ? r.issuedBefore : 0;
+      const quotaRemaining = Math.max(0, quota - used);
 
-    return {
-      ok: true,
-      items,
-      total,
-      limit,
-      offset,
-    };
+      return {
+        id: r.id,
+        email: r.email,
+        name: r.name ?? null,
+        code: null as string | null,
+        firstName: null as string | null,
+        lastName: null as string | null,
+        wa: (r.wa as string | null) ?? null,
+        source: r.source as Source,
+        status: r.status as ReqStatus,
+        isMasterMatch: typeof r.isMasterMatch === 'boolean' ? r.isMasterMatch : null,
+        createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : null,
+        updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : null,
+        masterQuota: typeof r.masterQuota === 'number' ? r.masterQuota : null,
+        issuedBefore: typeof r.issuedBefore === 'number' ? r.issuedBefore : null,
+        quotaRemaining,
+      };
+    });
+
+    return { ok: true, items, total, limit, offset };
   }
 }
