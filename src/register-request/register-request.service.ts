@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 
 type Source = 'MASTER' | 'WALKIN' | 'GIMMICK';
@@ -29,6 +29,8 @@ export interface ReqResp {
 
 @Injectable()
 export class RegisterRequestService {
+  private readonly log = new Logger('RegisterRequestService');
+
   constructor(private readonly prisma: PrismaService) {}
 
   /** Utility kecil untuk baca angka dari object dinamis */
@@ -275,11 +277,9 @@ export class RegisterRequestService {
 
   // ─────────────────────────────────────────────────────────
   // CONFIRM: izinkan useCount = 0 (donate-all)
-  //  - Ambil request
   //  - Hitung sisa kuota MASTER (remaining)
-  //  - Terbitkan sebanyak `toIssue` (di sini hanya update counter issuedBefore;
-  //    penerbitan tiket actual bisa kamu sambungkan ke service ticketing-mu)
-  //  - Jika ada sisa (leftover) dan source MASTER → catat ke SurplusLedger (DONATE)
+  //  - Terbitkan sebanyak toIssue (di sini hanya update counter issuedBefore)
+  //  - Jika ada sisa (leftover) dan source MASTER → catat ke Ledger DONATE
   // ─────────────────────────────────────────────────────────
   async confirm(input: { requestId: string; useCount: number }) {
     const { requestId, useCount } = input;
@@ -298,12 +298,8 @@ export class RegisterRequestService {
       },
     });
 
-    if (!req) {
-      return { ok: false, error: 'Request tidak ditemukan' };
-    }
-    if (req.status === 'CANCELLED') {
-      return { ok: false, error: 'Request sudah dibatalkan' };
-    }
+    if (!req) return { ok: false, error: 'Request tidak ditemukan' };
+    if (req.status === 'CANCELLED') return { ok: false, error: 'Request sudah dibatalkan' };
 
     const quota = typeof req.masterQuota === 'number' ? req.masterQuota : 0;
     const issued = typeof req.issuedBefore === 'number' ? req.issuedBefore : 0;
@@ -312,9 +308,14 @@ export class RegisterRequestService {
     const toIssue = Math.max(0, Math.min(remaining, Math.floor(useCount ?? 0)));
     const leftover = Math.max(0, remaining - toIssue);
 
-    // Transaksi: update issuedBefore (+toIssue), set CONFIRMED, tulis donation jika ada sisa
+    const debug: { ledgerModel?: string; leftover: number; toIssue: number; remaining: number } = {
+      leftover,
+      toIssue,
+      remaining,
+    };
+
     await this.prisma.$transaction(async (tx) => {
-      // Update request
+      // Update request → CONFIRMED + issuedBefore
       await tx.registrationRequest.update({
         where: { id: req.id },
         data: {
@@ -324,34 +325,58 @@ export class RegisterRequestService {
         },
       });
 
-      // Catat DONATE dari sisa kuota MASTER (jika ada)
+      // Catat DONATE ke ledger (jika ada sisa & MASTER)
       if (req.source === 'MASTER' && leftover > 0) {
-        try {
-          // Nama model/table mungkin berbeda; bungkus try-catch supaya tidak mematahkan transaksi bila tidak ada.
-          await (tx as any).surplusLedger.create({
-            data: {
-              eventId: req.eventId,
-              type: 'DONATE',
-              email: req.email,
-              amount: leftover,
-              refRequestId: req.id,
-              createdAt: new Date(),
-            },
-          });
-        } catch {
-          // abaikan jika schema berbeda; fokus utamanya validasi useCount=0 hidup kembali
-        }
+        const modelUsed = await this.createDonationLedger(tx as any, {
+          eventId: req.eventId,
+          type: 'DONATE',
+          email: req.email,
+          amount: leftover,
+          refRequestId: req.id,
+          createdAt: new Date(),
+        });
+        debug.ledgerModel = modelUsed ?? 'NONE';
+        this.log.log(`Donation ledger: model=${debug.ledgerModel} leftover=${leftover} event=${req.eventId} email=${req.email}`);
+      } else {
+        debug.ledgerModel = 'SKIPPED';
       }
-
-      // NOTE: Penerbitan tiket actual (createMany ke table Ticket) sengaja tidak dipaksakan di sini
-      // agar tidak bentrok dengan skema generator code milikmu. Kalau perlu, tinggal sambungkan:
-      // await tx.ticket.createMany({ data: [...toIssue tickets...] })
     });
 
-    return {
-      ok: true,
-      count: toIssue,
-      // ticket: { code: '...', status: 'QUEUED', name: req.name ?? '', email: req.email }, // kalau nanti kamu hubungkan issuance
-    };
+    return { ok: true, count: toIssue, debug };
+  }
+
+  /**
+   * Mencoba create ke beberapa nama model ledger yang mungkin dipakai di schema:
+   * - suplurLedger / SuplurLedger  (sesuai clue kamu)
+   * - surplusLedger / SurplusLedger
+   * - surplusPoolLedger / SurplusPoolLedger
+   * Return: nama model yang berhasil, atau undefined jika tidak ada yang cocok.
+   */
+  private async createDonationLedger(
+    tx: any,
+    data: { eventId: string; type: string; email: string; amount: number; refRequestId: string; createdAt: Date }
+  ): Promise<string | undefined> {
+    const candidates = [
+      'suplurLedger',
+      'SuplurLedger',
+      'surplusLedger',
+      'SurplusLedger',
+      'surplusPoolLedger',
+      'SurplusPoolLedger',
+    ];
+
+    for (const model of candidates) {
+      try {
+        if (tx?.[model]?.create) {
+          await tx[model].create({ data });
+          return model;
+        }
+      } catch (e) {
+        this.log.warn(`Ledger create failed on model=${model}: ${(e as Error).message}`);
+      }
+    }
+
+    this.log.warn('No ledger model matched. Donation not recorded.');
+    return undefined;
   }
 }
