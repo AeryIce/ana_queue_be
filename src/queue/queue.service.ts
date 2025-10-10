@@ -1,7 +1,7 @@
 // src/queue/queue.service.ts — REPLACE ALL
 
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
-import { Prisma, PrismaClient, TicketStatus } from '@prisma/client';
+import { Prisma, TicketStatus } from '@prisma/client';
 import { PrismaService } from '../prisma.service';
 
 type IdOrCode = { id?: string; code?: string };
@@ -32,7 +32,7 @@ export class QueueService {
       .map((r) => (typeof r.slotNo === 'number' ? r.slotNo : -1))
       .filter((n) => n > 0)
       .sort((a, b) => a - b);
-  }
+    }
 
   /** Ambil slot kosong (1..N) berdasarkan slot terpakai  */
   private async getFreeSlots(
@@ -64,6 +64,14 @@ export class QueueService {
     return t;
   }
 
+  private parseIdOrCode(v: string): IdOrCode {
+    const s = String(v || '').trim();
+    if (!s) return {};
+    if (s.includes('-')) return { code: s };
+    if (s.length > 20) return { id: s };
+    return { code: s };
+  }
+
   // ─────────────────────────────────────────────────────────
   // BOARD + POOL
   // ─────────────────────────────────────────────────────────
@@ -72,7 +80,8 @@ export class QueueService {
   async board(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
-    const [active, queued, skipped, next12, totals] = await this.prisma.$transaction([
+    // ambil list dengan transaksi (semua PrismaPromise)
+    const [active, queued, deferred, next12] = await this.prisma.$transaction([
       this.prisma.ticket.findMany({
         where: { eventId, status: TicketStatus.IN_PROCESS },
         orderBy: [{ slotNo: 'asc' }, { order: 'asc' }],
@@ -84,7 +93,7 @@ export class QueueService {
         select: { id: true, code: true, name: true, status: true, order: true },
       }),
       this.prisma.ticket.findMany({
-        where: { eventId, status: TicketStatus.SKIPPED },
+        where: { eventId, status: TicketStatus.DEFERRED },
         orderBy: [{ updatedAt: 'desc' }],
         select: { id: true, code: true, name: true, status: true, order: true },
       }),
@@ -94,23 +103,31 @@ export class QueueService {
         take: 12,
         select: { id: true, code: true, name: true, status: true, order: true },
       }),
-      (async () => {
-        const [a, q, n, s, d] = await Promise.all([
-          this.prisma.ticket.count({ where: { eventId, status: TicketStatus.IN_PROCESS } }),
-          this.prisma.ticket.count({ where: { eventId, status: TicketStatus.QUEUED } }),
-          this.prisma.ticket.count({ where: { eventId, status: TicketStatus.CALLED } }), // bila ada
-          this.prisma.ticket.count({ where: { eventId, status: TicketStatus.SKIPPED } }),
-          this.prisma.ticket.count({ where: { eventId, status: TicketStatus.DONE } }),
-        ]);
-        return { active: a, queue: q, called: n, skip: s, done: d, queueBatches: Math.ceil(q / ACTIVE_SLOTS) };
-      })(),
     ]);
+
+    // hitung totals DI LUAR $transaction (bukan PrismaPromise)
+    const [a, q, c, d, dn] = await Promise.all([
+      this.prisma.ticket.count({ where: { eventId, status: TicketStatus.IN_PROCESS } }),
+      this.prisma.ticket.count({ where: { eventId, status: TicketStatus.QUEUED } }),
+      this.prisma.ticket.count({ where: { eventId, status: TicketStatus.CALLED } }), // jika tidak dipakai akan 0
+      this.prisma.ticket.count({ where: { eventId, status: TicketStatus.DEFERRED } }),
+      this.prisma.ticket.count({ where: { eventId, status: TicketStatus.DONE } }),
+    ]);
+
+    const totals = {
+      active: a,
+      queue: q,
+      called: c,
+      skip: d, // skip grid = DEFERRED
+      done: dn,
+      queueBatches: Math.ceil(q / ACTIVE_SLOTS),
+    };
 
     return {
       ok: true,
       active,
       queue: queued,
-      skipGrid: skipped,
+      skipGrid: deferred,
       next: next12,
       nextCount: next12.length,
       totals,
@@ -148,7 +165,7 @@ export class QueueService {
     const amt = Math.max(0, Math.floor(Number(amount || 0)));
     if (amt <= 0) return { ok: false, error: 'amount harus > 0' };
     await this.prisma.surplusLedger.create({
-      data: { eventId, type: 'DONATE', amount: amt, email: null, refRequestId: null },
+      data: { eventId, type: 'DONATE', amount: amt, email: 'system', refRequestId: null },
     });
     return this.getPoolSafe(eventId);
   }
@@ -198,7 +215,7 @@ export class QueueService {
     return this.promoteQueueToActive(eventId);
   }
 
-  /** Skip  IN_PROCESS → SKIPPED (bebaskan slot) */
+  /** Skip  IN_PROCESS → DEFERRED (bebaskan slot) */
   async skipActive(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
@@ -208,13 +225,13 @@ export class QueueService {
       }
       await tx.ticket.update({
         where: { id: t.id },
-        data: { status: TicketStatus.SKIPPED, slotNo: null, updatedAt: new Date() },
+        data: { status: TicketStatus.DEFERRED, slotNo: null, updatedAt: new Date() },
       });
-      return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.SKIPPED };
+      return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.DEFERRED };
     });
   }
 
-  /** Recall SKIPPED/QUEUED → IN_PROCESS bila ada slot kosong; jika penuh dan status SKIPPED → tetap QUEUED */
+  /** Recall DEFERRED/QUEUED → IN_PROCESS bila ada slot kosong; jika penuh dan status DEFERRED → kembalikan ke QUEUED */
   async recall(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
@@ -222,8 +239,8 @@ export class QueueService {
 
       const free = await this.getFreeSlots(tx, eventId, ACTIVE_SLOTS);
       if (free.length === 0) {
-        // tidak ada slot: kalau SKIPPED → antrikan lagi
-        if (t.status === TicketStatus.SKIPPED) {
+        // tidak ada slot: kalau DEFERRED → antrikan lagi
+        if (t.status === TicketStatus.DEFERRED) {
           await tx.ticket.update({
             where: { id: t.id },
             data: { status: TicketStatus.QUEUED, slotNo: null, updatedAt: new Date() },
@@ -253,18 +270,5 @@ export class QueueService {
       });
       return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.DONE };
     });
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // Utils
-  // ─────────────────────────────────────────────────────────
-
-  private parseIdOrCode(v: string): IdOrCode {
-    const s = String(v || '').trim();
-    if (!s) return {};
-    if (s.includes('-')) return { code: s };
-    if (s.length > 20) return { id: s };
-    // default: coba code dulu
-    return { code: s };
   }
 }
