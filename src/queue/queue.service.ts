@@ -32,7 +32,7 @@ export class QueueService {
       .map((r) => (typeof r.slotNo === 'number' ? r.slotNo : -1))
       .filter((n) => n > 0)
       .sort((a, b) => a - b);
-    }
+  }
 
   /** Ambil slot kosong (1..N) berdasarkan slot terpakai  */
   private async getFreeSlots(
@@ -51,7 +51,8 @@ export class QueueService {
     eventId: string,
     idOrCode: IdOrCode,
   ) {
-    const { id, code } = idOrCode;
+    const { id } = idOrCode;
+    const code = idOrCode.code?.toUpperCase(); // normalisasi code
     if (!id && !code) throw new BadRequestException('id atau code wajib diisi');
     const t = await tx.ticket.findFirst({
       where: {
@@ -67,9 +68,9 @@ export class QueueService {
   private parseIdOrCode(v: string): IdOrCode {
     const s = String(v || '').trim();
     if (!s) return {};
-    if (s.includes('-')) return { code: s };
+    if (s.includes('-')) return { code: s.toUpperCase() };
     if (s.length > 20) return { id: s };
-    return { code: s };
+    return { code: s.toUpperCase() };
   }
 
   // ─────────────────────────────────────────────────────────
@@ -215,6 +216,11 @@ export class QueueService {
     return this.promoteQueueToActive(eventId);
   }
 
+  /** Alias untuk controller lama: promote() */
+  async promote(eventId: string) {
+    return this.promoteQueueToActive(eventId);
+  }
+
   /** Skip  IN_PROCESS → DEFERRED (bebaskan slot) */
   async skipActive(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
@@ -257,6 +263,11 @@ export class QueueService {
       });
       return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.IN_PROCESS, slotNo: slot };
     });
+  }
+
+  /** Alias untuk controller lama: recallByCode() */
+  async recallByCode(eventId: string, code: string) {
+    return this.recall(eventId, code);
   }
 
   /** Selesaikan → DONE (bebaskan slot) */
