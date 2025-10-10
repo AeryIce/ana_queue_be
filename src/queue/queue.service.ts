@@ -11,30 +11,136 @@ export class QueueService {
   constructor(private prisma: PrismaService) {}
 
   // === NEW: Pool selalu 200; fallback pool:0 agar FE tidak 500 ===
-  async getPoolSafe(eventId: string) {
-    if (!eventId) return { ok: false, pool: 0, reason: 'missing_eventId' };
-    try {
-      const rows = await this.prisma.$queryRawUnsafe<{ pool: number }[]>(
-        `
-        SELECT COALESCE(SUM(
-          CASE
-            WHEN "type"::text = 'DONATE'   THEN amount
-            WHEN "type"::text = 'ALLOCATE' THEN -amount
-            ELSE 0
-          END
-        ), 0) AS pool
-        FROM "SurplusLedger"
-        WHERE "eventId" = $1
-        `,
-        eventId,
-      );
-      const pool = rows?.[0]?.pool ?? 0;
-      return { ok: true, eventId, pool };
-    } catch {
-      // kalau tabel ledger belum ada / enum beda → jangan 500
-      return { ok: false, eventId, pool: 0, reason: 'query_error' };
+  // === REPLACE ONLY getPoolSafe() WITH THIS VERSION ===
+async getPoolSafe(eventId: string) {
+  if (!eventId) return { ok: false, pool: 0, reason: 'missing_eventId' };
+
+  // Helper debug flag
+  const DEBUG = process.env.DEBUG_API === '1';
+
+  // Strategy A: Prisma model (surplusLedger) → JS reduce
+  try {
+    // @ts-ignore - if model exists, this works; if not it will throw
+    const rows = await (this.prisma as any).surplusLedger.findMany({
+      where: { eventId },
+      select: { type: true, amount: true },
+    });
+
+    let pool = 0;
+    for (const r of rows) {
+      const t = String(r.type).toUpperCase();
+      if (t === 'DONATE') pool += Number(r.amount || 0);
+      else if (t === 'ALLOCATE') pool -= Number(r.amount || 0);
     }
+    return { ok: true, eventId, pool, method: 'prisma_findMany' };
+  } catch (eA) {
+    if (DEBUG) console.error('[POOL:A] prisma_findMany failed:', eA instanceof Error ? eA.message : eA);
   }
+
+  // Strategy B: queryRaw ke "SurplusLedger" (PascalCase)
+  try {
+    const rowsB = await this.prisma.$queryRawUnsafe<{ pool: number }[]>(
+      `
+      SELECT COALESCE(SUM(
+        CASE
+          WHEN "type"::text = 'DONATE'   THEN amount
+          WHEN "type"::text = 'ALLOCATE' THEN -amount
+          ELSE 0
+        END
+      ), 0) AS pool
+      FROM "SurplusLedger"
+      WHERE "eventId" = $1
+      `,
+      eventId,
+    );
+    const pool = rowsB?.[0]?.pool ?? 0;
+    return { ok: true, eventId, pool, method: 'raw_Pascal' };
+  } catch (eB) {
+    if (DEBUG) console.error('[POOL:B] raw Pascal failed:', eB instanceof Error ? eB.message : eB);
+  }
+
+  // Strategy C: queryRaw ke "surplus_ledger" (snake_case)
+  try {
+    const rowsC = await this.prisma.$queryRawUnsafe<{ pool: number }[]>(
+      `
+      SELECT COALESCE(SUM(
+        CASE
+          WHEN type::text = 'DONATE'   THEN amount
+          WHEN type::text = 'ALLOCATE' THEN -amount
+          ELSE 0
+        END
+      ), 0) AS pool
+      FROM surplus_ledger
+      WHERE event_id = $1
+      `,
+      eventId,
+    );
+    const pool = rowsC?.[0]?.pool ?? 0;
+    return { ok: true, eventId, pool, method: 'raw_snake' };
+  } catch (eC) {
+    if (DEBUG) console.error('[POOL:C] raw snake failed:', eC instanceof Error ? eC.message : eC);
+  }
+
+  // Semua strategi gagal → jangan 500; balikin 0 + alasan
+  return { ok: false, eventId, pool: 0, reason: 'all_strategies_failed' };
+}
+
+// === ADD THIS NEW METHOD (for diagnostics) ===
+async diagPool(eventId: string) {
+  const out: any = { eventId, tables: {}, tries: [] };
+
+  // info schema (Postgres)
+  try {
+    const t1 = await this.prisma.$queryRawUnsafe<any[]>(
+      `SELECT table_name FROM information_schema.tables WHERE table_schema='public'`
+    );
+    out.tables.public = t1.map(r => r.table_name);
+  } catch (e) {
+    out.tables.error = e instanceof Error ? e.message : String(e);
+  }
+
+  // Try A/B/C like getPoolSafe but capture error messages
+  const tries: any[] = [];
+
+  // A
+  try {
+    // @ts-ignore
+    const rows = await (this.prisma as any).surplusLedger.findMany({
+      where: { eventId },
+      select: { type: true, amount: true },
+      take: 5,
+    });
+    tries.push({ method: 'prisma_findMany', ok: true, sample: rows });
+  } catch (eA) {
+    tries.push({ method: 'prisma_findMany', ok: false, error: eA instanceof Error ? eA.message : String(eA) });
+  }
+
+  // B
+  try {
+    const rowsB = await this.prisma.$queryRawUnsafe<any[]>(
+      `SELECT * FROM "SurplusLedger" WHERE "eventId" = $1 LIMIT 5`,
+      eventId,
+    );
+    tries.push({ method: 'raw_Pascal', ok: true, sample: rowsB });
+  } catch (eB) {
+    tries.push({ method: 'raw_Pascal', ok: false, error: eB instanceof Error ? eB.message : String(eB) });
+  }
+
+  // C
+  try {
+    const rowsC = await this.prisma.$queryRawUnsafe<any[]>(
+      `SELECT * FROM surplus_ledger WHERE event_id = $1 LIMIT 5`,
+      eventId,
+    );
+    tries.push({ method: 'raw_snake', ok: true, sample: rowsC });
+  } catch (eC) {
+    tries.push({ method: 'raw_snake', ok: false, error: eC instanceof Error ? eC.message : String(eC) });
+  }
+
+  out.tries = tries;
+  return out;
+}
+
 
   // Ambil kepala Queue (batch-1) FIFO
   private async popFromQueueHead(tx: Prisma.TransactionClient, eventId: string) {

@@ -45,4 +45,10 @@ export class QueueController {
   done(@Query('eventId') eventId: string, @Param('id') id: string) {
     return this.svc.done(eventId, id);
   }
+  
+  // === NEW: Diagnostic endpoint ===
+  @Get('api/_diag/pool')
+  diagPool(@Query('eventId') eventId: string) {
+    return this.svc.diagPool(eventId);
+  }
 }

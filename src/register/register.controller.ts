@@ -30,6 +30,7 @@ export class RegisterController {
   }
 
   // === NEW: Approve → terbitkan tiket AH-xxx status CONFIRMED ===
+  // GANTI BAGIAN catch DI endpoint register-confirm() seperti ini:
   @Post('register-confirm')
   async confirm(@Body() dto: ConfirmDto) {
     if (!dto?.eventId) throw new BadRequestException('eventId wajib diisi');
@@ -39,10 +40,22 @@ export class RegisterController {
       return await this.svc.confirm(dto);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (msg.toLowerCase().includes('pending request not found')) {
-        throw new NotFoundException('Data pending tidak ditemukan');
+      // Log jelas ke console Railway
+      console.error('[register-confirm] DTO=', dto, '| ERROR=', msg);
+
+      // Mapping human readable
+      const low = msg.toLowerCase();
+      if (low.includes('pending request not found')) {
+        // FE approve biasanya pakai requestId; kalau salah id → biar 404
+        throw new NotFoundException('Data pending tidak ditemukan (cek requestId/email & eventId)');
       }
+      if (low.includes('queuecounter belum di-seed')) {
+        throw new BadRequestException('QueueCounter belum di-seed untuk event ini');
+      }
+
+      // fallback
       throw new BadRequestException(msg);
     }
   }
+
 }
