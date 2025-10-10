@@ -158,7 +158,7 @@ export class RegisterService {
       const startOrder = nextOrder - useCount
       const endOrder = nextOrder - 1
 
-      // 4) Insert tiket (RAW, tanpa kolom batch/slot) — CAST param status ke enum Postgres
+      // 4) Insert tiket (RAW, tanpa kolom batch/slot) — TANPA ON CONFLICT; pakai WHERE NOT EXISTS
       const createdCodes: string[] = []
       for (let i = 0; i < useCount; i++) {
         const order = startOrder + i
@@ -168,8 +168,10 @@ export class RegisterService {
         await tx.$executeRawUnsafe(
           `
           INSERT INTO "Ticket" ("eventId","code","order","status","name","email")
-          VALUES ($1,$2,$3, $4::"TicketStatus", $5,$6)
-          ON CONFLICT ("eventId","code") DO NOTHING
+          SELECT $1,$2,$3,$4::"TicketStatus",$5,$6
+          WHERE NOT EXISTS (
+            SELECT 1 FROM "Ticket" WHERE "eventId" = $1 AND "code" = $2
+          )
           `,
           eventId,      // $1
           code,         // $2
