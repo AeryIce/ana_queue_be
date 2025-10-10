@@ -18,9 +18,11 @@ export class RegisterService {
     const name = `${mu.firstName} ${mu.lastName}`.trim()
 
     // 2) Hitung sudah berapa tiket yang dikeluarkan (pakai SQL agar aman walau types lama)
-    const issuedRow = await this.prisma.$queryRaw<
-      Array<{ count: number }>
-    >`SELECT COUNT(*)::int AS count FROM "Ticket" WHERE "eventId" = ${eventId} AND "email" = ${email};`
+    const issuedRow = await this.prisma.$queryRaw<Array<{ count: number }>>`
+      SELECT COUNT(*)::int AS count
+      FROM "Ticket"
+      WHERE "eventId" = ${eventId} AND "email" = ${email};
+    `
     const issued = issuedRow?.[0]?.count ?? 0
     const remaining = mu.quota - issued
 
@@ -43,10 +45,12 @@ export class RegisterService {
 
     // 3) Transaksi: ambil blok nomor + create tiket berurutan
     const txResult = await this.prisma.$transaction(async (tx) => {
-      const updated = await tx.$queryRaw<
-        Array<{ nextOrder: number }>
-      >`UPDATE "queue_counters" SET "nextOrder" = "nextOrder" + ${remaining} WHERE "eventId" = ${eventId} RETURNING "nextOrder";`
-
+      const updated = await tx.$queryRaw<Array<{ nextOrder: number }>>`
+        UPDATE "queue_counters"
+        SET "nextOrder" = "nextOrder" + ${remaining}
+        WHERE "eventId" = ${eventId}
+        RETURNING "nextOrder";
+      `
       if (!updated?.[0]?.nextOrder) {
         throw new Error('QueueCounter belum di-seed untuk event ini')
       }
@@ -82,7 +86,12 @@ export class RegisterService {
 
     const allForEmail = await this.prisma.$queryRaw<
       Array<{ code: string; order: number; status: TicketStatus }>
-    >`SELECT "code", "order", "status" FROM "Ticket" WHERE "eventId" = ${eventId} AND "email" = ${email} ORDER BY "order" ASC;`
+    >`
+      SELECT "code", "order", "status"
+      FROM "Ticket"
+      WHERE "eventId" = ${eventId} AND "email" = ${email}
+      ORDER BY "order" ASC;
+    `
 
     return {
       message: `Berhasil alokasikan ${txResult.created.length} tiket`,
@@ -149,7 +158,7 @@ export class RegisterService {
       const startOrder = nextOrder - useCount
       const endOrder = nextOrder - 1
 
-      // 4) Insert tiket (RAW, tanpa kolom batch/slot). Status aman: 'QUEUED'.
+      // 4) Insert tiket (RAW, tanpa kolom batch/slot) — CAST param status ke enum Postgres
       const createdCodes: string[] = []
       for (let i = 0; i < useCount; i++) {
         const order = startOrder + i
@@ -159,10 +168,15 @@ export class RegisterService {
         await tx.$executeRawUnsafe(
           `
           INSERT INTO "Ticket" ("eventId","code","order","status","name","email")
-          VALUES ($1,$2,$3,$4,$5,$6)
+          VALUES ($1,$2,$3, $4::"TicketStatus", $5,$6)
           ON CONFLICT ("eventId","code") DO NOTHING
           `,
-          eventId, code, order, 'QUEUED', name, email
+          eventId,      // $1
+          code,         // $2
+          order,        // $3
+          'QUEUED',     // $4 (di-cast ke enum "TicketStatus")
+          name,         // $5
+          email         // $6
         )
       }
 
