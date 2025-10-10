@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common'
 import { TicketStatus } from '@prisma/client'
 import { PrismaService } from '../prisma.service'
+import { randomUUID } from 'crypto'
 
 @Injectable()
 export class RegisterService {
@@ -17,7 +18,7 @@ export class RegisterService {
     }
     const name = `${mu.firstName} ${mu.lastName}`.trim()
 
-    // 2) Hitung sudah berapa tiket yang dikeluarkan (pakai SQL agar aman walau types lama)
+    // 2) Hitung sudah berapa tiket yang dikeluarkan
     const issuedRow = await this.prisma.$queryRaw<Array<{ count: number }>>`
       SELECT COUNT(*)::int AS count
       FROM "Ticket"
@@ -116,7 +117,7 @@ export class RegisterService {
     const emailLower = input.email?.trim().toLowerCase()
 
     return this.prisma.$transaction(async (tx) => {
-      // 1) Ambil PENDING request (prioritas by requestId; kalau tidak ada, pakai email+eventId)
+      // 1) Ambil PENDING request
       const req = await tx.registrationRequest.findFirst({
         where: {
           status: 'PENDING',
@@ -130,7 +131,7 @@ export class RegisterService {
       const name = req.name ?? ''
       const email = req.email
 
-      // 2) Cek sudah punya tiket aktif/berjalan? (RAW supaya tidak menyentuh kolom batch)
+      // 2) Cek sudah punya tiket aktif/berjalan? (RAW)
       const existRows = await tx.$queryRaw<Array<{ code: string; status: string }>>`
         SELECT "code", "status"::text AS status
         FROM "Ticket"
@@ -158,27 +159,34 @@ export class RegisterService {
       const startOrder = nextOrder - useCount
       const endOrder = nextOrder - 1
 
-      // 4) Insert tiket (RAW, tanpa kolom batch/slot) — TANPA ON CONFLICT; pakai WHERE NOT EXISTS
+      // 4) Insert tiket (RAW) — tambahkan id, createdAt, updatedAt agar NOT NULL terpenuhi
       const createdCodes: string[] = []
       for (let i = 0; i < useCount; i++) {
         const order = startOrder + i
         const code = `AH-${order.toString().padStart(3,'0')}`
         createdCodes.push(code)
 
+        const id = randomUUID()
+        const now = new Date()
+
         await tx.$executeRawUnsafe(
           `
-          INSERT INTO "Ticket" ("eventId","code","order","status","name","email")
-          SELECT $1,$2,$3,$4::"TicketStatus",$5,$6
+          INSERT INTO "Ticket" ("id","eventId","code","name","status","order","createdAt","updatedAt","email","wa")
+          SELECT $1,$2,$3,$4,$5::"TicketStatus",$6,$7,$8,$9,$10
           WHERE NOT EXISTS (
-            SELECT 1 FROM "Ticket" WHERE "eventId" = $1 AND "code" = $2
+            SELECT 1 FROM "Ticket" WHERE "eventId" = $2 AND "code" = $3
           )
           `,
-          eventId,      // $1
-          code,         // $2
-          order,        // $3
-          'QUEUED',     // $4 (di-cast ke enum "TicketStatus")
-          name,         // $5
-          email         // $6
+          id,          // $1
+          eventId,     // $2
+          code,        // $3
+          name,        // $4
+          'QUEUED',    // $5 (cast ke enum)
+          order,       // $6
+          now,         // $7 createdAt
+          now,         // $8 updatedAt
+          email,       // $9
+          null         // $10 wa (atau isi req.wa kalau ada)
         )
       }
 
