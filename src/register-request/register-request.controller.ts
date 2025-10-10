@@ -63,10 +63,7 @@ export class RegisterRequestController {
 
   // ─────────────────────────────────────────────────────────
   // POST /api/register-confirm
-  // Catatan penting:
-  //  - IZINKAN useCount = 0 untuk skenario "donate all" (sesuai journey lama)
-  //  - Valid < 0 tetap ditolak.
-  //  - requestId wajib.
+  // IZINKAN useCount = 0 (donate-all), larang nilai negatif/bukan bilangan bulat
   // ─────────────────────────────────────────────────────────
   @Post('register-confirm')
   async confirm(@Body() body: { requestId?: string; useCount?: number }) {
@@ -76,8 +73,6 @@ export class RegisterRequestController {
     if (!reqId) {
       return { ok: false, error: 'requestId wajib diisi' };
     }
-
-    // IZINKAN 0 → donate all; larang nilai negatif / bukan bilangan bulat
     if (!Number.isInteger(num) || num < 0) {
       return { ok: false, error: 'useCount harus bilangan >= 0' };
     }

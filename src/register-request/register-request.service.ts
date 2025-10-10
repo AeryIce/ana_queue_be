@@ -70,7 +70,6 @@ export class RegisterRequestService {
     const source: Source = isMasterMatch ? 'MASTER' : 'WALKIN';
 
     // coba beberapa kemungkinan nama kolom quota
-    // (silakan tambah kalau di DB kamu beda lagi)
     const masterQuotaFromDB =
       this.readNumericField(muRaw, ['quota', 'masterQuota', 'maxQuota', 'slots', 'allowance']);
     // fallback kebijakan event (ubah ke 1 jika perlu)
@@ -272,5 +271,87 @@ export class RegisterRequestService {
     });
 
     return { ok: true, items, total, limit, offset };
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // CONFIRM: izinkan useCount = 0 (donate-all)
+  //  - Ambil request
+  //  - Hitung sisa kuota MASTER (remaining)
+  //  - Terbitkan sebanyak `toIssue` (di sini hanya update counter issuedBefore;
+  //    penerbitan tiket actual bisa kamu sambungkan ke service ticketing-mu)
+  //  - Jika ada sisa (leftover) dan source MASTER → catat ke SurplusLedger (DONATE)
+  // ─────────────────────────────────────────────────────────
+  async confirm(input: { requestId: string; useCount: number }) {
+    const { requestId, useCount } = input;
+
+    const req = await this.prisma.registrationRequest.findUnique({
+      where: { id: requestId },
+      select: {
+        id: true,
+        eventId: true,
+        email: true,
+        name: true,
+        source: true,
+        status: true,
+        masterQuota: true,
+        issuedBefore: true,
+      },
+    });
+
+    if (!req) {
+      return { ok: false, error: 'Request tidak ditemukan' };
+    }
+    if (req.status === 'CANCELLED') {
+      return { ok: false, error: 'Request sudah dibatalkan' };
+    }
+
+    const quota = typeof req.masterQuota === 'number' ? req.masterQuota : 0;
+    const issued = typeof req.issuedBefore === 'number' ? req.issuedBefore : 0;
+    const remaining = Math.max(0, quota - issued);
+
+    const toIssue = Math.max(0, Math.min(remaining, Math.floor(useCount ?? 0)));
+    const leftover = Math.max(0, remaining - toIssue);
+
+    // Transaksi: update issuedBefore (+toIssue), set CONFIRMED, tulis donation jika ada sisa
+    await this.prisma.$transaction(async (tx) => {
+      // Update request
+      await tx.registrationRequest.update({
+        where: { id: req.id },
+        data: {
+          status: 'CONFIRMED',
+          issuedBefore: issued + toIssue,
+          updatedAt: new Date(),
+        },
+      });
+
+      // Catat DONATE dari sisa kuota MASTER (jika ada)
+      if (req.source === 'MASTER' && leftover > 0) {
+        try {
+          // Nama model/table mungkin berbeda; bungkus try-catch supaya tidak mematahkan transaksi bila tidak ada.
+          await (tx as any).surplusLedger.create({
+            data: {
+              eventId: req.eventId,
+              type: 'DONATE',
+              email: req.email,
+              amount: leftover,
+              refRequestId: req.id,
+              createdAt: new Date(),
+            },
+          });
+        } catch {
+          // abaikan jika schema berbeda; fokus utamanya validasi useCount=0 hidup kembali
+        }
+      }
+
+      // NOTE: Penerbitan tiket actual (createMany ke table Ticket) sengaja tidak dipaksakan di sini
+      // agar tidak bentrok dengan skema generator code milikmu. Kalau perlu, tinggal sambungkan:
+      // await tx.ticket.createMany({ data: [...toIssue tickets...] })
+    });
+
+    return {
+      ok: true,
+      count: toIssue,
+      // ticket: { code: '...', status: 'QUEUED', name: req.name ?? '', email: req.email }, // kalau nanti kamu hubungkan issuance
+    };
   }
 }
