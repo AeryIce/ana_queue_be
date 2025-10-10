@@ -1,443 +1,194 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
-import type { Prisma, Ticket } from '@prisma/client';
 import { TicketStatus } from '@prisma/client';
 
 const ACTIVE_SLOT_SIZE = Number(process.env.ACTIVE_SLOT_SIZE ?? 6);
-const BATCH_SIZE = 6;
 
 @Injectable()
 export class QueueService {
   constructor(private prisma: PrismaService) {}
 
-  // === NEW: Pool selalu 200; fallback pool:0 agar FE tidak 500 ===
-  // === REPLACE ONLY getPoolSafe() WITH THIS VERSION ===
-async getPoolSafe(eventId: string) {
-  if (!eventId) return { ok: false, pool: 0, reason: 'missing_eventId' };
-
-  // Helper debug flag
-  const DEBUG = process.env.DEBUG_API === '1';
-
-  // Strategy A: Prisma model (surplusLedger) → JS reduce
-  try {
-    // @ts-ignore - if model exists, this works; if not it will throw
-    const rows = await (this.prisma as any).surplusLedger.findMany({
-      where: { eventId },
-      select: { type: true, amount: true },
-    });
-
-    let pool = 0;
-    for (const r of rows) {
-      const t = String(r.type).toUpperCase();
-      if (t === 'DONATE') pool += Number(r.amount || 0);
-      else if (t === 'ALLOCATE') pool -= Number(r.amount || 0);
-    }
-    return { ok: true, eventId, pool, method: 'prisma_findMany' };
-  } catch (eA) {
-    if (DEBUG) console.error('[POOL:A] prisma_findMany failed:', eA instanceof Error ? eA.message : eA);
-  }
-
-  // Strategy B: queryRaw ke "SurplusLedger" (PascalCase)
-  try {
-    const rowsB = await this.prisma.$queryRawUnsafe<{ pool: number }[]>(
-      `
-      SELECT COALESCE(SUM(
-        CASE
-          WHEN "type"::text = 'DONATE'   THEN amount
-          WHEN "type"::text = 'ALLOCATE' THEN -amount
-          ELSE 0
-        END
-      ), 0) AS pool
-      FROM "SurplusLedger"
-      WHERE "eventId" = $1
-      `,
-      eventId,
-    );
-    const pool = rowsB?.[0]?.pool ?? 0;
-    return { ok: true, eventId, pool, method: 'raw_Pascal' };
-  } catch (eB) {
-    if (DEBUG) console.error('[POOL:B] raw Pascal failed:', eB instanceof Error ? eB.message : eB);
-  }
-
-  // Strategy C: queryRaw ke "surplus_ledger" (snake_case)
-  try {
-    const rowsC = await this.prisma.$queryRawUnsafe<{ pool: number }[]>(
-      `
-      SELECT COALESCE(SUM(
-        CASE
-          WHEN type::text = 'DONATE'   THEN amount
-          WHEN type::text = 'ALLOCATE' THEN -amount
-          ELSE 0
-        END
-      ), 0) AS pool
-      FROM surplus_ledger
-      WHERE event_id = $1
-      `,
-      eventId,
-    );
-    const pool = rowsC?.[0]?.pool ?? 0;
-    return { ok: true, eventId, pool, method: 'raw_snake' };
-  } catch (eC) {
-    if (DEBUG) console.error('[POOL:C] raw snake failed:', eC instanceof Error ? eC.message : eC);
-  }
-
-  // Semua strategi gagal → jangan 500; balikin 0 + alasan
-  return { ok: false, eventId, pool: 0, reason: 'all_strategies_failed' };
-}
-
-// === ADD THIS NEW METHOD (for diagnostics) ===
-async diagPool(eventId: string) {
-  const out: any = { eventId, tables: {}, tries: [] };
-
-  // info schema (Postgres)
-  try {
-    const t1 = await this.prisma.$queryRawUnsafe<any[]>(
-      `SELECT table_name FROM information_schema.tables WHERE table_schema='public'`
-    );
-    out.tables.public = t1.map(r => r.table_name);
-  } catch (e) {
-    out.tables.error = e instanceof Error ? e.message : String(e);
-  }
-
-  // Try A/B/C like getPoolSafe but capture error messages
-  const tries: any[] = [];
-
-  // A
-  try {
-    // @ts-ignore
-    const rows = await (this.prisma as any).surplusLedger.findMany({
-      where: { eventId },
-      select: { type: true, amount: true },
-      take: 5,
-    });
-    tries.push({ method: 'prisma_findMany', ok: true, sample: rows });
-  } catch (eA) {
-    tries.push({ method: 'prisma_findMany', ok: false, error: eA instanceof Error ? eA.message : String(eA) });
-  }
-
-  // B
-  try {
-    const rowsB = await this.prisma.$queryRawUnsafe<any[]>(
-      `SELECT * FROM "SurplusLedger" WHERE "eventId" = $1 LIMIT 5`,
-      eventId,
-    );
-    tries.push({ method: 'raw_Pascal', ok: true, sample: rowsB });
-  } catch (eB) {
-    tries.push({ method: 'raw_Pascal', ok: false, error: eB instanceof Error ? eB.message : String(eB) });
-  }
-
-  // C
-  try {
-    const rowsC = await this.prisma.$queryRawUnsafe<any[]>(
-      `SELECT * FROM surplus_ledger WHERE event_id = $1 LIMIT 5`,
-      eventId,
-    );
-    tries.push({ method: 'raw_snake', ok: true, sample: rowsC });
-  } catch (eC) {
-    tries.push({ method: 'raw_snake', ok: false, error: eC instanceof Error ? eC.message : String(eC) });
-  }
-
-  out.tries = tries;
-  return out;
-}
-
-
-  // Ambil kepala Queue (batch-1) FIFO
-  private async popFromQueueHead(tx: Prisma.TransactionClient, eventId: string) {
-    const head = await tx.ticket.findFirst({
-      where: { eventId, status: TicketStatus.QUEUED },
-      orderBy: [{ batchNo: 'asc' as const }, { posInBatch: 'asc' as const }],
-    });
-    if (!head) return null;
-
-    await tx.$executeRawUnsafe(
-      `
-      UPDATE "Ticket"
-      SET "posInBatch" = "posInBatch" - 1
-      WHERE "eventId" = $1 AND "status" = 'QUEUED' AND "batchNo" = $2
-      `,
-      eventId,
-      head.batchNo
-    );
-    return head;
-  }
-
-  private async pushToQueueEnd(
-    tx: Prisma.TransactionClient,
-    t: { id: string; eventId: string; isSkipped?: boolean | null }
-  ) {
-    const last = await tx.ticket.findFirst({
-      where: { eventId: t.eventId, status: TicketStatus.QUEUED },
-      orderBy: [{ batchNo: 'desc' as const }, { posInBatch: 'desc' as const }],
-    });
-
-    let nextBatch = 1;
-    let nextPos = 1;
-    if (last?.batchNo) {
-      nextBatch = last.batchNo;
-      nextPos = (last.posInBatch ?? 0) + 1;
-      if (nextPos > BATCH_SIZE) {
-        nextBatch = last.batchNo + 1;
-        nextPos = 1;
+  // === Pool aman (selalu 200) ===
+  async getPoolSafe(eventId: string) {
+    if (!eventId) return { ok: false, pool: 0, reason: 'missing_eventId' };
+    try {
+      // Coba via Prisma model surplusLedger jika ada
+      // @ts-ignore
+      const rows = await (this.prisma as any)?.surplusLedger?.findMany?.({
+        where: { eventId },
+        select: { type: true, amount: true },
+      });
+      if (Array.isArray(rows)) {
+        let pool = 0;
+        for (const r of rows) {
+          const t = String(r.type).toUpperCase();
+          if (t === 'DONATE') pool += Number(r.amount || 0);
+          else if (t === 'ALLOCATE') pool -= Number(r.amount || 0);
+        }
+        return { ok: true, eventId, pool, method: 'prisma' };
       }
-    }
+    } catch {}
 
-    return tx.ticket.update({
-      where: { id: t.id },
-      data: {
-        status: TicketStatus.QUEUED,
-        batchNo: nextBatch,
-        posInBatch: nextPos,
-        slotNo: null,
-        isSkipped: t.isSkipped ?? false,
-      },
-    });
-  }
-
-  private async fillOneActiveSlot(
-    tx: Prisma.TransactionClient,
-    eventId: string,
-    slotNo: number
-  ) {
-    const next = await this.popFromQueueHead(tx, eventId);
-    if (!next) return null;
-
-    return tx.ticket.update({
-      where: { id: next.id },
-      data: {
-        status: TicketStatus.ACTIVE,
-        slotNo,
-        batchNo: null,
-        posInBatch: null,
-        inProcess: true,
-        inProcessAt: new Date(),
-        isSkipped: false,
-      },
-    });
-  }
-
-  async callNextBatch(eventId: string) {
-    return this.prisma.$transaction(async (tx) => {
-      const next6 = await tx.ticket.findMany({
-        where: { eventId, status: TicketStatus.CONFIRMED },
-        orderBy: [{ confirmedAt: 'asc' as const }],
-        take: BATCH_SIZE,
-      });
-      if (next6.length === 0) return { added: 0 };
-
-      const last = await tx.ticket.findFirst({
-        where: { eventId, status: TicketStatus.QUEUED },
-        orderBy: [{ batchNo: 'desc' as const }, { posInBatch: 'desc' as const }],
-      });
-      const lastNo = last?.batchNo ?? 0;
-      const newBatchNo = lastNo + 1;
-
-      await Promise.all(
-        next6.map((t, i) =>
-          tx.ticket.update({
-            where: { id: t.id },
-            data: {
-              status: TicketStatus.QUEUED,
-              batchNo: newBatchNo,
-              posInBatch: i + 1,
-            },
-          })
-        )
+    // Fallback ke raw (PascalCase)
+    try {
+      const rowsB = await this.prisma.$queryRawUnsafe<{ pool: number }[]>(
+        `
+        SELECT COALESCE(SUM(
+          CASE
+            WHEN "type"::text = 'DONATE'   THEN amount
+            WHEN "type"::text = 'ALLOCATE' THEN -amount
+            ELSE 0
+          END
+        ), 0) AS pool
+        FROM "SurplusLedger"
+        WHERE "eventId" = $1
+        `,
+        eventId,
       );
+      const pool = rowsB?.[0]?.pool ?? 0;
+      return { ok: true, eventId, pool, method: 'raw_Pascal' };
+    } catch {}
 
-      return { added: next6.length, batchNo: newBatchNo };
-    });
+    return { ok: false, eventId, pool: 0, reason: 'no_ledger_table' };
   }
 
+  // Diagnostic pool
+  async diagPool(eventId: string) {
+    const out: any = { eventId, tables: {}, tries: [] };
+    try {
+      const t1 = await this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT table_name FROM information_schema.tables WHERE table_schema='public'`
+      );
+      out.tables.public = t1.map(r => r.table_name);
+    } catch (e) {
+      out.tables.error = e instanceof Error ? e.message : String(e);
+    }
+    try {
+      const rowsB = await this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT * FROM "SurplusLedger" WHERE "eventId" = $1 LIMIT 5`, eventId
+      );
+      out.tries.push({ method: 'raw_Pascal', ok: true, sample: rowsB });
+    } catch (eB) {
+      out.tries.push({ method: 'raw_Pascal', ok: false, error: eB instanceof Error ? eB.message : eB });
+    }
+    return out;
+  }
+
+  // Donate ke pool
+  async donate(eventId: string, amount: number) {
+    if (!eventId) throw new Error('eventId required');
+    await this.prisma.$executeRawUnsafe(
+      `INSERT INTO "SurplusLedger" ("eventId","type","amount") VALUES ($1,$2,$3)`,
+      eventId, 'DONATE', amount
+    );
+    return this.getPoolSafe(eventId);
+  }
+
+  // ==== Ops tanpa batch ====
+
+  // Promosikan tiket QUEUED ke ACTIVE (maks ACTIVE_SLOT_SIZE)
   async promoteQueueToActive(eventId: string) {
     return this.prisma.$transaction(async (tx) => {
-      const activeCount = await tx.ticket.count({
+      const active = await tx.ticket.findMany({
+        where: { eventId, status: TicketStatus.ACTIVE },
+        select: { id: true },
+      });
+      const free = Math.max(0, ACTIVE_SLOT_SIZE - active.length);
+      if (free <= 0) return { filled: 0, active: active.length };
+
+      const heads = await tx.ticket.findMany({
+        where: { eventId, status: TicketStatus.QUEUED },
+        orderBy: [{ order: 'asc' }],
+        take: free,
+      });
+      for (const h of heads) {
+        await tx.ticket.update({
+          where: { id: h.id },
+          data: { status: TicketStatus.ACTIVE },
+        });
+      }
+      const afterActive = await tx.ticket.findMany({
         where: { eventId, status: TicketStatus.ACTIVE },
       });
-      if (activeCount > 0) {
-        throw new BadRequestException('Active must be empty to promote.');
-      }
-
-      const results: Ticket[] = [];
-      for (let slot = 1; slot <= ACTIVE_SLOT_SIZE; slot++) {
-        const filled = await this.fillOneActiveSlot(tx, eventId, slot);
-        if (!filled) break;
-        results.push(filled);
-      }
-      return { filled: results.length, active: results };
+      return { filled: heads.length, active: afterActive };
     });
   }
 
+  // Skip ACTIVE -> balik QUEUED (ke ekor: kita pakai order besar saja biar di akhir)
   async skipActive(eventId: string, id: string) {
     return this.prisma.$transaction(async (tx) => {
       const t = await tx.ticket.findFirst({ where: { id, eventId } });
       if (!t || t.status !== TicketStatus.ACTIVE) {
         throw new BadRequestException('Not ACTIVE');
       }
+      // Dorong ke ekor: set order = max(order)+1
+      const maxRow = await tx.$queryRawUnsafe<{ max: number }[]>(
+        `SELECT COALESCE(MAX("order"),0)::int AS max FROM "Ticket" WHERE "eventId" = $1`,
+        eventId,
+      );
+      const nextOrder = (maxRow?.[0]?.max ?? 0) + 1;
 
-      const slot = t.slotNo!;
       await tx.ticket.update({
         where: { id },
-        data: {
-          isSkipped: true,
-          skippedAt: new Date(),
-          inProcess: false,
-          inProcessAt: null,
-          status: TicketStatus.QUEUED,
-          slotNo: null,
-        },
+        data: { status: TicketStatus.QUEUED, ...(Number.isFinite(nextOrder) ? { order: nextOrder } : {}) },
       });
-      await this.pushToQueueEnd(tx, { id, eventId, isSkipped: true });
 
-      const replacement = await this.fillOneActiveSlot(tx, eventId, slot);
-      return { replacedBy: replacement?.id ?? null };
+      return { ok: true, movedToOrder: nextOrder };
     });
   }
 
+  // Recall tiket QUEUED ke ACTIVE (jika ada slot)
   async recall(eventId: string, id: string) {
     return this.prisma.$transaction(async (tx) => {
       const t = await tx.ticket.findFirst({ where: { id, eventId } });
       if (!t) throw new BadRequestException('Not found');
 
-      const used = await tx.ticket.findMany({
-        where: { eventId, status: TicketStatus.ACTIVE },
-        select: { slotNo: true },
-      });
-      const taken = new Set(used.map((s) => s.slotNo!));
-      const free = Array.from({ length: ACTIVE_SLOT_SIZE }, (_, i) => i + 1).find(
-        (s) => !taken.has(s)
-      );
+      const activeCount = await tx.ticket.count({ where: { eventId, status: TicketStatus.ACTIVE } });
+      if (activeCount >= ACTIVE_SLOT_SIZE) throw new BadRequestException('No free active slot');
 
-      if (free) {
-        return tx.ticket.update({
-          where: { id },
-          data: {
-            status: TicketStatus.ACTIVE,
-            slotNo: free,
-            batchNo: null,
-            posInBatch: null,
-            isSkipped: false,
-            inProcess: true,
-            inProcessAt: new Date(),
-          },
-        });
-      }
-
-      const preemptSlot = ACTIVE_SLOT_SIZE;
-      const kicked = await tx.ticket.findFirst({
-        where: { eventId, status: TicketStatus.ACTIVE, slotNo: preemptSlot },
-      });
-      if (!kicked) throw new BadRequestException('No slot to preempt');
-
-      await tx.ticket.update({
-        where: { id: kicked.id },
-        data: {
-          status: TicketStatus.QUEUED,
-          batchNo: 1,
-          posInBatch: 1,
-          slotNo: null,
-          inProcess: false,
-          inProcessAt: null,
-        },
-      });
-      await tx.$executeRawUnsafe(
-        `
-        UPDATE "Ticket"
-        SET "posInBatch" = "posInBatch" + 1
-        WHERE "eventId" = $1 AND "status" = 'QUEUED' AND "batchNo" = 1 AND "id" <> $2
-        `,
-        eventId,
-        kicked.id
-      );
-
-      return tx.ticket.update({
-        where: { id },
-        data: {
-          status: TicketStatus.ACTIVE,
-          slotNo: preemptSlot,
-          batchNo: null,
-          posInBatch: null,
-          isSkipped: false,
-          inProcess: true,
-          inProcessAt: new Date(),
-        },
-      });
+      return tx.ticket.update({ where: { id }, data: { status: TicketStatus.ACTIVE } });
     });
   }
 
+  // Selesaikan ACTIVE -> DONE
   async done(eventId: string, id: string) {
     return this.prisma.$transaction(async (tx) => {
       const t = await tx.ticket.findFirst({ where: { id, eventId } });
       if (!t || t.status !== TicketStatus.ACTIVE) {
         throw new BadRequestException('Not ACTIVE');
       }
-
-      const ms = t.inProcessAt
-        ? Date.now() - new Date(t.inProcessAt).getTime()
-        : null;
-
       await tx.ticket.update({
         where: { id },
-        data: {
-          status: TicketStatus.DONE,
-          slotNo: null,
-          inProcess: false,
-          inProcessAt: null,
-          processingMs: ms ? BigInt(ms) : null,
-        },
+        data: { status: TicketStatus.DONE },
       });
-
       return { ok: true };
     });
   }
 
-  // Snapshot untuk FE/TV
+  // Snapshot sederhana untuk Board/TV (tanpa batch)
   async board(eventId: string) {
-    const [active, queued, next, skip] = await Promise.all([
+    const [active, queued] = await Promise.all([
       this.prisma.ticket.findMany({
         where: { eventId, status: TicketStatus.ACTIVE },
-        orderBy: [{ slotNo: 'asc' as const }],
+        orderBy: [{ order: 'asc' }],
+        select: { id: true, code: true, name: true, status: true, order: true },
       }),
       this.prisma.ticket.findMany({
         where: { eventId, status: TicketStatus.QUEUED },
-        orderBy: [{ batchNo: 'asc' as const }, { posInBatch: 'asc' as const }],
-      }),
-      this.prisma.ticket.findMany({
-        where: { eventId, status: TicketStatus.CONFIRMED },
-        orderBy: [{ confirmedAt: 'asc' as const }],
-      }),
-      this.prisma.ticket.findMany({
-        where: {
-          eventId,
-          isSkipped: true,
-          status: { in: [TicketStatus.QUEUED, TicketStatus.ACTIVE] },
-        },
-        orderBy: [{ skippedAt: 'asc' as const }],
+        orderBy: [{ order: 'asc' }],
+        select: { id: true, code: true, name: true, status: true, order: true },
       }),
     ]);
 
-    const batches = queued.reduce<Record<number, Ticket[]>>((acc, t) => {
-      if (!t.batchNo) return acc;
-      acc[t.batchNo] = acc[t.batchNo] ?? [];
-      acc[t.batchNo].push(t);
-      return acc;
-    }, {});
-
     return {
       active,
-      queue: Object.entries(batches).map(([no, items]) => ({
-        batchNo: Number(no),
-        items,
-      })),
-      nextCount: next.length,
-      next: next.slice(0, 10),
-      skipGrid: skip,
+      queue: queued,
+      next: [],
+      skipGrid: [],
+      nextCount: 0,
       totals: {
         active: active.length,
-        queueBatches: Object.keys(batches).length,
-        next: next.length,
-        skip: skip.length,
-        siapAntri: active.length + queued.length + next.length + skip.length,
+        queued: queued.length,
       },
     };
   }

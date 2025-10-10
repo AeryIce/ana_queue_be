@@ -1,11 +1,11 @@
-import { Controller, Get, Post, Param, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, Param, Query } from '@nestjs/common';
 import { QueueService } from './queue.service';
 
 @Controller()
 export class QueueController {
   constructor(private readonly svc: QueueService) {}
 
-  // === NEW: alias buat FE ===
+  // === FE aliases ===
   @Get('api/board')
   apiBoard(@Query('eventId') eventId: string) {
     return this.svc.board(eventId);
@@ -15,40 +15,38 @@ export class QueueController {
     return this.svc.getPoolSafe(eventId);
   }
 
-  // === existing ops ===
-  @Get('ops/board')
-  board(@Query('eventId') eventId: string) {
-    return this.svc.board(eventId);
-  }
-
-  @Post('ops/call-next-batch')
-  callNext(@Query('eventId') eventId: string) {
-    return this.svc.callNextBatch(eventId);
-  }
-
-  @Post('ops/promote-queue-to-active')
+  // === Ops (legacy, tanpa batch) ===
+  @Post('api/promote')
   promote(@Query('eventId') eventId: string) {
     return this.svc.promoteQueueToActive(eventId);
   }
 
-  @Post('ops/skip/:id')
+  @Post('api/skip/:id')
   skip(@Query('eventId') eventId: string, @Param('id') id: string) {
     return this.svc.skipActive(eventId, id);
   }
 
-  @Post('ops/recall/:id')
+  @Post('api/recall/:id')
   recall(@Query('eventId') eventId: string, @Param('id') id: string) {
     return this.svc.recall(eventId, id);
   }
 
-  @Post('ops/done/:id')
+  @Post('api/done/:id')
   done(@Query('eventId') eventId: string, @Param('id') id: string) {
     return this.svc.done(eventId, id);
   }
-  
-  // === NEW: Diagnostic endpoint ===
+
+  // === Diagnostic
   @Get('api/_diag/pool')
   diagPool(@Query('eventId') eventId: string) {
     return this.svc.diagPool(eventId);
+  }
+
+  // === Pool donate (admin)
+  @Post('api/pool-donate')
+  async donatePool(@Body() body: { eventId?: string; amount?: number }) {
+    const eventId = body?.eventId || 'seed-event';
+    const amount = Math.max(1, Math.min(Number(body?.amount ?? 1), 100));
+    return this.svc.donate(eventId, amount);
   }
 }
