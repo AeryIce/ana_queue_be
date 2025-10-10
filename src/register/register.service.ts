@@ -95,160 +95,182 @@ export class RegisterService {
     }
   }
 
-  // === Approve (ADMIN) — dengan DONATE/ALLOCATE pool ===
-  async confirm(input: {
-    eventId?: string                // opsional: fallback ke eventId milik request PENDING
-    requestId?: string
-    email?: string                  // fallback kalau tak pakai requestId
-    source?: 'MASTER'|'WALKIN'|'GIMMICK'
-    useCount?: number               // IZINKAN 0..10 (0 = donate-all)
-  }) {
-    const useCountRaw = Number.isFinite(Number(input.useCount)) ? Number(input.useCount) : 0
-    const useCount = Math.max(0, Math.min(10, Math.floor(useCountRaw))) // 0..10
-    const reqId = input.requestId?.trim()
-    const emailLower = input.email?.trim().toLowerCase()
+ // === Approve (ADMIN) — dengan DONATE/ALLOCATE pool & proteksi Walk-in ===
+async confirm(input: {
+  eventId?: string
+  requestId?: string
+  email?: string
+  source?: 'MASTER' | 'WALKIN' | 'GIMMICK'
+  useCount?: number // 0..10 (0 = donate-all untuk MASTER)
+}) {
+  const useCountRaw = Number.isFinite(Number(input.useCount)) ? Number(input.useCount) : 0;
+  const useCount = Math.max(0, Math.min(10, Math.floor(useCountRaw)));
+  const reqId = input.requestId?.trim();
+  const emailLower = input.email?.trim().toLowerCase();
 
-    return this.prisma.$transaction(async (tx) => {
-      // 1) Ambil PENDING request
-      const req = await tx.registrationRequest.findFirst({
-        where: {
-          status: 'PENDING',
-          ...(reqId ? { id: reqId } : {}),
-          ...(!reqId && input.eventId && emailLower ? { eventId: input.eventId, email: emailLower } : {}),
-        },
-        select: {
-          id: true,
-          eventId: true,
-          email: true,
-          name: true,
-          wa: true,
-          source: true,
-          masterQuota: true,   // mungkin ada, kalau tidak ya undefined/null
-          issuedBefore: true,  // mungkin ada
-        },
-      })
-      if (!req) throw new NotFoundException('Pending request not found')
+  return this.prisma.$transaction(async (tx) => {
+    // 1) Ambil PENDING request
+    const req = await tx.registrationRequest.findFirst({
+      where: {
+        status: 'PENDING',
+        ...(reqId ? { id: reqId } : {}),
+        ...(!reqId && input.eventId && emailLower ? { eventId: input.eventId, email: emailLower } : {}),
+      },
+      select: {
+        id: true,
+        eventId: true,
+        email: true,
+        name: true,
+        wa: true,
+        source: true,
+        masterQuota: true,
+        issuedBefore: true,
+      },
+    });
+    if (!req) return { ok: false, error: 'Pending request tidak ditemukan' };
 
-      const eventId = input.eventId ?? req.eventId
-      const name = req.name ?? ''
-      const email = req.email
-      const source = (input.source ?? (req.source as any)) as 'MASTER'|'WALKIN'|'GIMMICK'|undefined
+    const eventId = input.eventId ?? req.eventId;
+    const name = req.name ?? '';
+    const email = req.email;
+    const source = (input.source ?? (req.source as any)) as 'MASTER' | 'WALKIN' | 'GIMMICK' | undefined;
 
-      // 2) Hitung quota & remaining untuk MASTER (robust)
-      let quota = 0
-      if (source === 'MASTER') {
-        // coba dari request.masterQuota dulu
-        if (typeof req.masterQuota === 'number' && Number.isFinite(req.masterQuota)) {
-          quota = Math.max(0, req.masterQuota)
-        } else {
-          // fallback: baca dari MasterUser
-          const mu = await tx.masterUser.findUnique({ where: { email } })
-          quota = Math.max(0, mu?.quota ?? 0)
-        }
+    // 2) Hitung quota & remaining (MASTER)
+    let quota = 0;
+    if (source === 'MASTER') {
+      if (typeof req.masterQuota === 'number' && Number.isFinite(req.masterQuota)) {
+        quota = Math.max(0, req.masterQuota);
+      } else {
+        const mu = await tx.masterUser.findUnique({ where: { email } });
+        quota = Math.max(0, mu?.quota ?? 0);
       }
+    }
+    const issued = await tx.ticket.count({ where: { eventId, email } });
+    const remaining = source === 'MASTER' ? Math.max(0, quota - issued) : 0;
 
-      // issued total dari Ticket (paling akurat)
-      const issued = await tx.ticket.count({ where: { eventId, email } })
-      const remaining = source === 'MASTER' ? Math.max(0, quota - issued) : 0
+    // 3) Hitung pool available (untuk Walk-in/Gimmick)
+    let poolAvailable = 0;
+    if (source && source !== 'MASTER') {
+      const r = await tx.$queryRaw<Array<{ balance: number }>>`
+        SELECT COALESCE(SUM(CASE 
+          WHEN "type" = 'DONATE' THEN "amount"
+          WHEN "type" = 'ALLOCATE' THEN - "amount"
+          ELSE 0 END), 0)::int AS balance
+        FROM "SurplusLedger"
+        WHERE "eventId" = ${eventId};
+      `;
+      poolAvailable = Number(r?.[0]?.balance ?? 0);
+    }
 
-      // 3) Tentukan berapa yang diterbitkan & leftover (donate)
-      const toIssue = source === 'MASTER' ? Math.max(0, Math.min(remaining, useCount)) : useCount
-      const leftover = source === 'MASTER' ? Math.max(0, remaining - toIssue) : 0
+    // 4) Tentukan penerbitan
+    let toIssue = 0;
+    let leftover = 0;
+    if (source === 'MASTER') {
+      toIssue = Math.max(0, Math.min(remaining, useCount));
+      leftover = Math.max(0, remaining - toIssue); // akan DONATE
+    } else {
+      // WALKIN/GIMMICK: tak boleh melebihi stock pool
+      toIssue = Math.max(0, Math.min(useCount, poolAvailable));
+    }
 
-      // 4) Ambil nomor & buat tiket jika toIssue > 0
-      let startOrder = 0
-      let endOrder = -1
-      const createdCodes: string[] = []
+    // Proteksi: Walk-in tanpa stok pool → jangan CONFIRM, balikin error ramah
+    if (source && source !== 'MASTER' && toIssue === 0) {
+      return { ok: false, error: 'Pool kosong / tidak cukup untuk alokasi' };
+    }
 
-      if (toIssue > 0) {
-        const inc = await tx.$queryRaw<Array<{ nextOrder: number }>>`
-          UPDATE "queue_counters"
-          SET "nextOrder" = "nextOrder" + ${toIssue}
-          WHERE "eventId" = ${eventId}
-          RETURNING "nextOrder";
-        `
-        if (!inc?.[0]?.nextOrder) throw new BadRequestException('QueueCounter belum di-seed untuk event ini')
+    // 5) Ambil nomor & buat tiket jika toIssue > 0
+    let startOrder = 0;
+    let endOrder = -1;
+    const createdCodes: string[] = [];
 
-        const nextOrder = Number(inc[0].nextOrder)
-        startOrder = nextOrder - toIssue
-        endOrder = nextOrder - 1
+    if (toIssue > 0) {
+      const inc = await tx.$queryRaw<Array<{ nextOrder: number }>>`
+        UPDATE "queue_counters"
+        SET "nextOrder" = "nextOrder" + ${toIssue}
+        WHERE "eventId" = ${eventId}
+        RETURNING "nextOrder";
+      `;
+      if (!inc?.[0]?.nextOrder) return { ok: false, error: 'QueueCounter belum di-seed untuk event ini' };
 
-        for (let i = 0; i < toIssue; i++) {
-          const order = startOrder + i
-          const code = `AH-${order.toString().padStart(3,'0')}`
-          createdCodes.push(code)
+      const nextOrder = Number(inc[0].nextOrder);
+      startOrder = nextOrder - toIssue;
+      endOrder = nextOrder - 1;
 
-          const id = randomUUID()
-          const now = new Date()
+      for (let i = 0; i < toIssue; i++) {
+        const order = startOrder + i;
+        const code = `AH-${order.toString().padStart(3, '0')}`;
+        createdCodes.push(code);
 
-          await tx.$executeRawUnsafe(
-            `
-            INSERT INTO "Ticket" ("id","eventId","code","name","status","order","createdAt","updatedAt","email","wa")
-            SELECT $1,$2,$3,$4,$5::"TicketStatus",$6,$7,$8,$9,$10
-            WHERE NOT EXISTS (
-              SELECT 1 FROM "Ticket" WHERE "eventId" = $2 AND "code" = $3
-            )
-            `,
-            id,          // $1
-            eventId,     // $2
-            code,        // $3
-            name,        // $4
-            'QUEUED',    // $5
-            order,       // $6
-            now,         // $7 createdAt
-            now,         // $8 updatedAt
-            email,       // $9
-            req.wa ?? null // $10 wa
+        const id = randomUUID();
+        const now = new Date();
+
+        await tx.$executeRawUnsafe(
+          `
+          INSERT INTO "Ticket" ("id","eventId","code","name","status","order","createdAt","updatedAt","email","wa")
+          SELECT $1,$2,$3,$4,$5::"TicketStatus",$6,$7,$8,$9,$10
+          WHERE NOT EXISTS (
+            SELECT 1 FROM "Ticket" WHERE "eventId" = $2 AND "code" = $3
           )
-        }
+          `,
+          id, eventId, code, name, 'QUEUED', order, now, now, email, req.wa ?? null
+        );
       }
+    }
 
-      // 5) Update request -> CONFIRMED
+    // 6) Update status request:
+    // - MASTER: selalu CONFIRMED (meski donate-all)
+    // - WALKIN/GIMMICK: CONFIRMED hanya jika ada tiket yang diterbitkan
+    const shouldConfirm = source === 'MASTER' || toIssue > 0;
+    if (shouldConfirm) {
       await tx.registrationRequest.update({
         where: { id: req.id },
         data: { status: 'CONFIRMED', updatedAt: new Date() },
-      })
+      });
+    }
 
-      // 6) Ledger pool
-      try {
-        if (source === 'MASTER' && leftover > 0) {
-          await tx.surplusLedger.create({
-            data: {
-              eventId,
-              type: 'DONATE',
-              email,
-              amount: leftover,
-              refRequestId: req.id,
-              createdAt: new Date(),
-            },
-          })
-        }
-        if (source && source !== 'MASTER' && toIssue > 0) {
-          await tx.surplusLedger.create({
-            data: {
-              eventId,
-              type: 'ALLOCATE',
-              email,
-              amount: toIssue,
-              refRequestId: req.id,
-              createdAt: new Date(),
-            },
-          })
-        }
-      } catch {
-        // jangan patahkan flow approve kalau ledger tidak ada
+    // 7) Ledger pool
+    try {
+      if (source === 'MASTER' && leftover > 0) {
+        await tx.surplusLedger.create({
+          data: {
+            eventId,
+            type: 'DONATE',
+            email,
+            amount: leftover,
+            refRequestId: req.id,
+            createdAt: new Date(),
+          },
+        });
       }
+      if (source && source !== 'MASTER' && toIssue > 0) {
+        await tx.surplusLedger.create({
+          data: {
+            eventId,
+            type: 'ALLOCATE',
+            email,
+            amount: toIssue,
+            refRequestId: req.id,
+            createdAt: new Date(),
+          },
+        });
+      }
+    } catch {
+      // jangan patahkan flow approve kalau ledger tidak ada
+    }
 
-      const firstCode = createdCodes[0]
-      return {
-        ok: true,
-        ticket: firstCode ? { code: firstCode, status: 'QUEUED', name, email } : undefined,
-        allocatedRange: toIssue > 0 ? { from: startOrder, to: endOrder } : undefined,
-        count: toIssue,
-        leftover,
-        source: source ?? null,
-        remainingBefore: source === 'MASTER' ? remaining : null,
-      }
-    })
+    // 8) Respons (back-compat + array codes)
+    const firstCode = createdCodes[0];
+    return {
+      ok: true,
+      ticket: firstCode ? { code: firstCode, status: 'QUEUED', name, email } : undefined,
+      codes: createdCodes, // ← NEW: semua kode yang dibuat
+      allocatedRange: toIssue > 0 ? { from: startOrder, to: endOrder } : undefined,
+      count: toIssue,
+      leftover,
+      source: source ?? null,
+      remainingBefore: source === 'MASTER' ? remaining : null,
+      donatedAll: source === 'MASTER' && toIssue === 0 && leftover > 0, // ← NEW: sinyal donate-all
+    };
+  });
+}
   }
 }
