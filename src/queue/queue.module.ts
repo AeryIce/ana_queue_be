@@ -1,12 +1,11 @@
 import { Module } from '@nestjs/common';
-import { QueueService } from './queue.service';
+import { PrismaService } from '../prisma.service';
 import { QueueController } from './queue.controller';
-import { PrismaModule } from '../prisma.module';
+import { QueueService } from './queue.service';
 
 @Module({
-  imports: [PrismaModule],           // pakai Prisma dari Global module
   controllers: [QueueController],
-  providers: [QueueService],         // cukup QueueService
-  exports: [QueueService],           // <-- PENTING: agar terlihat di LegacyModule
+  providers: [QueueService, PrismaService],
+  exports: [QueueService],
 })
 export class QueueModule {}
