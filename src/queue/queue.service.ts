@@ -10,6 +10,32 @@ const BATCH_SIZE = 6;
 export class QueueService {
   constructor(private prisma: PrismaService) {}
 
+  // === NEW: Pool selalu 200; fallback pool:0 agar FE tidak 500 ===
+  async getPoolSafe(eventId: string) {
+    if (!eventId) return { ok: false, pool: 0, reason: 'missing_eventId' };
+    try {
+      const rows = await this.prisma.$queryRawUnsafe<{ pool: number }[]>(
+        `
+        SELECT COALESCE(SUM(
+          CASE
+            WHEN "type"::text = 'DONATE'   THEN amount
+            WHEN "type"::text = 'ALLOCATE' THEN -amount
+            ELSE 0
+          END
+        ), 0) AS pool
+        FROM "SurplusLedger"
+        WHERE "eventId" = $1
+        `,
+        eventId,
+      );
+      const pool = rows?.[0]?.pool ?? 0;
+      return { ok: true, eventId, pool };
+    } catch {
+      // kalau tabel ledger belum ada / enum beda → jangan 500
+      return { ok: false, eventId, pool: 0, reason: 'query_error' };
+    }
+  }
+
   // Ambil kepala Queue (batch-1) FIFO
   private async popFromQueueHead(tx: Prisma.TransactionClient, eventId: string) {
     const head = await tx.ticket.findFirst({
@@ -18,7 +44,6 @@ export class QueueService {
     });
     if (!head) return null;
 
-    // geser posisi batch-1 agar kompak
     await tx.$executeRawUnsafe(
       `
       UPDATE "Ticket"
@@ -31,7 +56,6 @@ export class QueueService {
     return head;
   }
 
-  // Dorong ke ekor Queue (buat batch baru jika penuh)
   private async pushToQueueEnd(
     tx: Prisma.TransactionClient,
     t: { id: string; eventId: string; isSkipped?: boolean | null }
@@ -59,13 +83,11 @@ export class QueueService {
         batchNo: nextBatch,
         posInBatch: nextPos,
         slotNo: null,
-        // pertahankan flag skip kalau ada
         isSkipped: t.isSkipped ?? false,
       },
     });
   }
 
-  // Isi satu slot Active dari Queue
   private async fillOneActiveSlot(
     tx: Prisma.TransactionClient,
     eventId: string,
@@ -88,7 +110,6 @@ export class QueueService {
     });
   }
 
-  // Next -> Queue (bentuk 1 batch baru, max 6)
   async callNextBatch(eventId: string) {
     return this.prisma.$transaction(async (tx) => {
       const next6 = await tx.ticket.findMany({
@@ -122,7 +143,6 @@ export class QueueService {
     });
   }
 
-  // Naikkan Batch-1 ke Active (saat Active kosong)
   async promoteQueueToActive(eventId: string) {
     return this.prisma.$transaction(async (tx) => {
       const activeCount = await tx.ticket.count({
@@ -142,7 +162,6 @@ export class QueueService {
     });
   }
 
-  // Skip dari Active: tandai skip, lempar ke ekor Queue, isi slot dari head
   async skipActive(eventId: string, id: string) {
     return this.prisma.$transaction(async (tx) => {
       const t = await tx.ticket.findFirst({ where: { id, eventId } });
@@ -151,7 +170,6 @@ export class QueueService {
       }
 
       const slot = t.slotNo!;
-      // tandai skip & turunkan dari active
       await tx.ticket.update({
         where: { id },
         data: {
@@ -165,13 +183,11 @@ export class QueueService {
       });
       await this.pushToQueueEnd(tx, { id, eventId, isSkipped: true });
 
-      // isi slot kosong dari queue head
       const replacement = await this.fillOneActiveSlot(tx, eventId, slot);
       return { replacedBy: replacement?.id ?? null };
     });
   }
 
-  // Recall dari Skip Grid
   async recall(eventId: string, id: string) {
     return this.prisma.$transaction(async (tx) => {
       const t = await tx.ticket.findFirst({ where: { id, eventId } });
@@ -201,14 +217,12 @@ export class QueueService {
         });
       }
 
-      // penuh → preempt slot terakhir (ACTIVE_SLOT_SIZE)
       const preemptSlot = ACTIVE_SLOT_SIZE;
       const kicked = await tx.ticket.findFirst({
         where: { eventId, status: TicketStatus.ACTIVE, slotNo: preemptSlot },
       });
       if (!kicked) throw new BadRequestException('No slot to preempt');
 
-      // yang digeser -> head batch-1
       await tx.ticket.update({
         where: { id: kicked.id },
         data: {
@@ -230,7 +244,6 @@ export class QueueService {
         kicked.id
       );
 
-      // recalled isi slot preempt
       return tx.ticket.update({
         where: { id },
         data: {
@@ -246,7 +259,6 @@ export class QueueService {
     });
   }
 
-  // Selesaikan slot
   async done(eventId: string, id: string) {
     return this.prisma.$transaction(async (tx) => {
       const t = await tx.ticket.findFirst({ where: { id, eventId } });

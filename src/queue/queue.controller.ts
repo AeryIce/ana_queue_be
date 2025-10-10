@@ -5,6 +5,17 @@ import { QueueService } from './queue.service';
 export class QueueController {
   constructor(private readonly svc: QueueService) {}
 
+  // === NEW: alias buat FE ===
+  @Get('api/board')
+  apiBoard(@Query('eventId') eventId: string) {
+    return this.svc.board(eventId);
+  }
+  @Get('api/pool')
+  apiPool(@Query('eventId') eventId: string) {
+    return this.svc.getPoolSafe(eventId);
+  }
+
+  // === existing ops ===
   @Get('ops/board')
   board(@Query('eventId') eventId: string) {
     return this.svc.board(eventId);

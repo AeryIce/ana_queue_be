@@ -1,6 +1,6 @@
 import { Body, Controller, Post, BadRequestException, ConflictException, NotFoundException } from '@nestjs/common'
 import { RegisterService } from './register.service'
-import { RegisterDto } from './register.dto'
+import { RegisterDto, ConfirmDto } from './register.dto'
 
 @Controller('api')
 export class RegisterController {
@@ -25,6 +25,23 @@ export class RegisterController {
         throw new ConflictException('Email sudah terdaftar / sedang diproses');
       }
       // error lain → 400 (hindari 500 gelap)
+      throw new BadRequestException(msg);
+    }
+  }
+
+  // === NEW: Approve → terbitkan tiket AH-xxx status CONFIRMED ===
+  @Post('register-confirm')
+  async confirm(@Body() dto: ConfirmDto) {
+    if (!dto?.eventId) throw new BadRequestException('eventId wajib diisi');
+    if (!dto?.requestId && !dto?.email) throw new BadRequestException('requestId atau email wajib diisi');
+
+    try {
+      return await this.svc.confirm(dto);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.toLowerCase().includes('pending request not found')) {
+        throw new NotFoundException('Data pending tidak ditemukan');
+      }
       throw new BadRequestException(msg);
     }
   }
