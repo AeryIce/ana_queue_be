@@ -1,29 +1,56 @@
-import { Controller, Post, Query, Param } from '@nestjs/common';
+// src/queue/queue.controller.ts — REPLACE ALL
+import { Controller, Get, Post, Param, Query } from '@nestjs/common';
 import { QueueService } from './queue.service';
 
 @Controller('api')
 export class QueueController {
   constructor(private readonly svc: QueueService) {}
 
-  /** Alias untuk call-next: isi slot aktif dari antrian. */
+  // TV/Admin board snapshot
+  @Get('board')
+  board(@Query('eventId') eventId: string) {
+    return this.svc.board(eventId);
+  }
+
+  // Pool saldo (DONATE - ALLOCATE)
+  @Get('pool')
+  pool(@Query('eventId') eventId: string) {
+    return this.svc.getPoolSafe(eventId);
+  }
+
+  // Promote queue → active (isi slot kosong; alias "Call Next")
   @Post('promote')
-  async promote(@Query('eventId') eventId?: string) {
-    if (!eventId) return { ok: false, error: 'eventId wajib diisi' };
-    return this.svc.promote(eventId);
+  promote(@Query('eventId') eventId: string) {
+    return this.svc.promoteQueueToActive(eventId);
   }
 
-  /** Beberapa FE lama memakai /api/call-next — samakan behavior dengan /promote */
+  // Opsi endpoint lain utk kompatibilitas
   @Post('call-next')
-  async callNext(@Query('eventId') eventId?: string) {
-    if (!eventId) return { ok: false, error: 'eventId wajib diisi' };
-    return this.svc.promote(eventId);
+  callNext(@Query('eventId') eventId: string) {
+    return this.svc.promoteQueueToActive(eventId);
   }
 
-  /** Recall dari SKIPPED (atau QUEUED) dengan kode. */
+  // Skip ticket IN_PROCESS → DEFERRED
+  @Post('skip/:idOrCode')
+  skip(@Param('idOrCode') idOrCode: string, @Query('eventId') eventId: string) {
+    return this.svc.skipActive(eventId, idOrCode);
+  }
+
+  // Recall: DEFERRED/QUEUED → IN_PROCESS (jika ada slot)
+  @Post('recall/:idOrCode')
+  recall(@Param('idOrCode') idOrCode: string, @Query('eventId') eventId: string) {
+    return this.svc.recall(eventId, idOrCode);
+  }
+
+  // Kompat: recall-by-code/AH-001
   @Post('recall-by-code/:code')
-  async recall(@Param('code') code: string, @Query('eventId') eventId?: string) {
-    if (!eventId) return { ok: false, error: 'eventId wajib diisi' };
-    if (!code) return { ok: false, error: 'code wajib diisi' };
-    return this.svc.recallByCode(eventId, code.toUpperCase());
+  recallByCode(@Param('code') code: string, @Query('eventId') eventId: string) {
+    return this.svc.recall(eventId, (code || '').toUpperCase());
+  }
+
+  // Selesaikan tiket → DONE
+  @Post('done/:idOrCode')
+  done(@Param('idOrCode') idOrCode: string, @Query('eventId') eventId: string) {
+    return this.svc.done(eventId, idOrCode);
   }
 }
