@@ -1,3 +1,5 @@
+// src/queue/queue.controller.ts — REPLACE ALL
+
 import { Controller, Get, Post, Param, Query } from '@nestjs/common';
 import { QueueService } from './queue.service';
 
@@ -5,10 +7,13 @@ import { QueueService } from './queue.service';
 export class QueueController {
   constructor(private readonly svc: QueueService) {}
 
+  // === BASIC MONITORING ===
+
   @Get('board')
   async board(@Query('eventId') eventId = 'seed-event') {
     try {
-      return await this.svc.board(eventId);
+      const r = await this.svc.board(eventId);
+      return { ok: true, ...r };
     } catch (e: any) {
       return { ok: false, error: e?.message || 'board failed' };
     }
@@ -17,7 +22,8 @@ export class QueueController {
   @Get('pool')
   async pool(@Query('eventId') eventId = 'seed-event') {
     try {
-      return await this.svc.getPoolSafe(eventId);
+      const r = await this.svc.getPoolSafe(eventId);
+      return { ok: true, ...r };
     } catch (e: any) {
       return { ok: false, error: e?.message || 'pool failed' };
     }
@@ -26,42 +32,43 @@ export class QueueController {
   @Get('pool/diag')
   async diag(@Query('eventId') eventId = 'seed-event') {
     try {
-      return await this.svc.diagPool(eventId);
+      const r = await this.svc.diagPool(eventId);
+      return { ok: true, ...r };
     } catch (e: any) {
       return { ok: false, error: e?.message || 'diag failed' };
     }
   }
 
-  // === TEAM B controls ===
+  // === TEAM B CONTROLS ===
 
-  // Call Next (promote queued -> in_process) — POST!
-  // Call Next (promote queued -> in_process)
-@Post('promote')
-async promote(@Query('eventId') eventId = 'seed-event') {
-  try {
-    // hasil dari service sudah mengandung { ok: true, promoted, codes, reason }
-    return await this.svc.promoteQueueToActive(eventId);
-  } catch (e: any) {
-    return { ok: false, error: e?.message || 'promote failed' };
+  // Call Next (promote queued → in_process)
+  @Post('promote')
+  async promote(@Query('eventId') eventId = 'seed-event') {
+    try {
+      const r = await this.svc.promoteQueueToActive(eventId);
+      return r; // service sudah mengandung { ok, promoted, codes, reason }
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'promote failed' };
+    }
   }
-}
 
-
-  // Skip active -> deferred
+  // Skip (in_process → deferred)
   @Post('skip/:id')
   async skip(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      return await this.svc.skipActive(eventId, id);
+      const r = await this.svc.skipActive(eventId, id);
+      return r;
     } catch (e: any) {
       return { ok: false, error: e?.message || 'skip failed' };
     }
   }
 
-  // Recall by code or id (support legacy route name)
+  // Recall by id (deferred/queued → in_process)
   @Post('recall/:id')
   async recall(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      return await this.svc.recall(eventId, id);
+      const r = await this.svc.recall(eventId, id);
+      return r;
     } catch (e: any) {
       return { ok: false, error: e?.message || 'recall failed' };
     }
@@ -71,17 +78,19 @@ async promote(@Query('eventId') eventId = 'seed-event') {
   @Post('recall-by-code/:code')
   async recallByCode(@Param('code') code: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      return await this.svc.recall(eventId, code.toUpperCase());
+      const r = await this.svc.recall(eventId, code.toUpperCase());
+      return r;
     } catch (e: any) {
       return { ok: false, error: e?.message || 'recall-by-code failed' };
     }
   }
 
-  // Done (finish)
+  // Done (finish process)
   @Post('done/:id')
   async done(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      return await this.svc.done(eventId, id);
+      const r = await this.svc.done(eventId, id);
+      return r;
     } catch (e: any) {
       return { ok: false, error: e?.message || 'done failed' };
     }

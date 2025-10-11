@@ -15,11 +15,14 @@ const ACTIVE_SLOTS =
 export class QueueService {
   constructor(private readonly prisma: PrismaService) {}
 
-  // ─────────────────────────────────────────────────────────
-  // Helpers
-  // ─────────────────────────────────────────────────────────
+  private parseIdOrCode(v: string): IdOrCode {
+    const s = String(v || '').trim();
+    if (!s) return {};
+    if (s.includes('-')) return { code: s };
+    if (s.length > 20) return { id: s };
+    return { code: s };
+  }
 
-  /** Cari tiket by id atau code (dalam event tertentu) */
   private async findTicketByIdOrCode(
     tx: Prisma.TransactionClient,
     eventId: string,
@@ -34,24 +37,11 @@ export class QueueService {
     return t;
   }
 
-  private parseIdOrCode(v: string): IdOrCode {
-    const s = String(v || '').trim();
-    if (!s) return {};
-    if (s.includes('-')) return { code: s.toUpperCase() };
-    if (s.length > 20) return { id: s };
-    return { code: s.toUpperCase() };
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // BOARD + POOL
-  // ─────────────────────────────────────────────────────────
-
-  /** Snapshot untuk TV/Queue/Admin */
+  // ─── BOARD & POOL ───────────────────────────────────────
   async board(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
-    // Ambil tiga list utama sekaligus (tanpa query "next" terpisah)
-    const [active, queued, deferred] = await this.prisma.$transaction([
+    const [active, queued, deferred, nextN] = await this.prisma.$transaction([
       this.prisma.ticket.findMany({
         where: { eventId, status: TicketStatus.IN_PROCESS },
         orderBy: [{ order: 'asc' }],
@@ -67,12 +57,14 @@ export class QueueService {
         orderBy: [{ updatedAt: 'desc' }],
         select: { id: true, code: true, name: true, status: true, order: true },
       }),
+      this.prisma.ticket.findMany({
+        where: { eventId, status: TicketStatus.QUEUED },
+        orderBy: [{ order: 'asc' }],
+        take: 60, // tampilkan banyak agar Next nggak mentok 5
+        select: { id: true, code: true, name: true, status: true, order: true },
+      }),
     ]);
 
-    // next = potongan awal dari queued → konsisten & hemat query
-    const next = queued.slice(0, 60);
-
-    // Totals lain tetap dihitung terpisah
     const [a, q, c, d, dn] = await Promise.all([
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.IN_PROCESS } }),
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.QUEUED } }),
@@ -81,27 +73,24 @@ export class QueueService {
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.DONE } }),
     ]);
 
-    const totals = {
-      active: a,
-      queue: q,
-      called: c,
-      skip: d, // skip grid = DEFERRED
-      done: dn,
-      queueBatches: Math.ceil(q / ACTIVE_SLOTS),
-    };
-
     return {
       ok: true,
       active,
       queue: queued,
       skipGrid: deferred,
-      next,
-      nextCount: next.length,
-      totals,
+      next: nextN,
+      nextCount: nextN.length,
+      totals: {
+        active: a,
+        queue: q,
+        called: c,
+        skip: d,
+        done: dn,
+        queueBatches: Math.ceil(q / ACTIVE_SLOTS),
+      },
     };
   }
 
-  /** Hitung saldo pool (DONATE - ALLOCATE) */
   async getPoolSafe(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     const r = await this.prisma.$queryRaw<Array<{ balance: number }>>`
@@ -115,7 +104,6 @@ export class QueueService {
     return { ok: true, eventId, pool: Number(r?.[0]?.balance ?? 0), method: 'getPoolSafe' };
   }
 
-  /** Diagnostik pool + beberapa baris terbaru */
   async diagPool(eventId: string) {
     const s = await this.getPoolSafe(eventId);
     const last = await this.prisma.surplusLedger.findMany({
@@ -126,7 +114,6 @@ export class QueueService {
     return { ...s, last };
   }
 
-  /** Donasi manual (opsional) */
   async donate(eventId: string, amount: number) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     const amt = Math.max(0, Math.floor(Number(amount || 0)));
@@ -137,11 +124,7 @@ export class QueueService {
     return this.getPoolSafe(eventId);
   }
 
-  // ─────────────────────────────────────────────────────────
-  // PROMOTE / SKIP / RECALL / DONE (tanpa slotNo/batchNo)
-  // ─────────────────────────────────────────────────────────
-
-  /** Naikkan QUEUED → IN_PROCESS sampai kapasitas slot aktif */
+  // ─── PROMOTE / SKIP / RECALL / DONE (tanpa slotNo) ─────
   async promoteQueueToActive(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
@@ -149,11 +132,8 @@ export class QueueService {
       const activeCount = await tx.ticket.count({
         where: { eventId, status: TicketStatus.IN_PROCESS },
       });
-
       const capacity = Math.max(0, ACTIVE_SLOTS - activeCount);
-      if (capacity <= 0) {
-        return { ok: true, promoted: 0, codes: [], reason: 'no-free-slot' };
-      }
+      if (capacity <= 0) return { ok: true, promoted: 0, codes: [], reason: 'no-free-slot' };
 
       const pick = await tx.ticket.findMany({
         where: { eventId, status: TicketStatus.QUEUED },
@@ -161,10 +141,7 @@ export class QueueService {
         take: capacity,
         select: { id: true, code: true },
       });
-
-      if (pick.length === 0) {
-        return { ok: true, promoted: 0, codes: [], reason: 'queue-empty' };
-      }
+      if (pick.length === 0) return { ok: true, promoted: 0, codes: [], reason: 'queue-empty' };
 
       for (const t of pick) {
         await tx.ticket.update({
@@ -172,25 +149,20 @@ export class QueueService {
           data: { status: TicketStatus.IN_PROCESS, updatedAt: new Date() },
         });
       }
-
       const codes = pick.map((p) => p.code).filter(Boolean) as string[];
       return { ok: true, promoted: pick.length, codes };
     });
   }
 
-  /** Alias legacy: Call Next 6 */
   async callNextBatch(eventId: string) {
     return this.promoteQueueToActive(eventId);
   }
 
-  /** Skip: IN_PROCESS → DEFERRED */
   async skipActive(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
       const t = await this.findTicketByIdOrCode(tx, eventId, this.parseIdOrCode(idOrCode));
-      if (t.status !== TicketStatus.IN_PROCESS) {
-        return { ok: false, error: 'Ticket bukan IN_PROCESS' };
-      }
+      if (t.status !== TicketStatus.IN_PROCESS) return { ok: false, error: 'Ticket bukan IN_PROCESS' };
       await tx.ticket.update({
         where: { id: t.id },
         data: { status: TicketStatus.DEFERRED, updatedAt: new Date() },
@@ -199,11 +171,6 @@ export class QueueService {
     });
   }
 
-  /**
-   * Recall:
-   * - Jika ada kapasitas → DEFERRED/QUEUED → IN_PROCESS
-   * - Jika penuh & sumber DEFERRED → kembalikan ke QUEUED (ikut antrian)
-   */
   async recall(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
@@ -233,7 +200,6 @@ export class QueueService {
     });
   }
 
-  /** Selesaikan → DONE */
   async done(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
@@ -244,13 +210,5 @@ export class QueueService {
       });
       return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.DONE };
     });
-  }
-
-  // ── Aliases untuk kompatibilitas controller/legacy ───────────────────────────
-  async promote(eventId: string) {
-    return this.promoteQueueToActive(eventId);
-  }
-  async recallByCode(eventId: string, code: string) {
-    return this.recall(eventId, code);
   }
 }
