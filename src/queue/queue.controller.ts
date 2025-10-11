@@ -35,15 +35,17 @@ export class QueueController {
   // === TEAM B controls ===
 
   // Call Next (promote queued -> in_process) — POST!
-  @Post('promote')
-  async promote(@Query('eventId') eventId = 'seed-event') {
-    try {
-      const r = await this.svc.promoteQueueToActive(eventId);
-      return { ok: true, ...r };
-    } catch (e: any) {
-      return { ok: false, error: e?.message || 'promote failed' };
-    }
+  // Call Next (promote queued -> in_process)
+@Post('promote')
+async promote(@Query('eventId') eventId = 'seed-event') {
+  try {
+    // hasil dari service sudah mengandung { ok: true, promoted, codes, reason }
+    return await this.svc.promoteQueueToActive(eventId);
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'promote failed' };
   }
+}
+
 
   // Skip active -> deferred
   @Post('skip/:id')
