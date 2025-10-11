@@ -1,56 +1,114 @@
-// src/queue/queue.controller.ts — REPLACE ALL
 import { Controller, Get, Post, Param, Query } from '@nestjs/common';
 import { QueueService } from './queue.service';
+
+function errMessage(e: unknown) {
+  if (!e) return 'Unknown error';
+  if (typeof e === 'string') return e;
+  if (typeof (e as any).message === 'string') return (e as any).message;
+  try { return JSON.stringify(e); } catch { return String(e); }
+}
 
 @Controller('api')
 export class QueueController {
   constructor(private readonly svc: QueueService) {}
 
-  // TV/Admin board snapshot
   @Get('board')
-  board(@Query('eventId') eventId: string) {
-    return this.svc.board(eventId);
+  async board(@Query('eventId') eventId: string) {
+    try {
+      return await this.svc.board(eventId);
+    } catch (e) {
+      // log lengkap ke console server
+      // @ts-ignore
+      console.error('[GET /api/board] ERROR:', e?.stack || e);
+      return { ok: false, error: errMessage(e) };
+    }
   }
 
-  // Pool saldo (DONATE - ALLOCATE)
   @Get('pool')
-  pool(@Query('eventId') eventId: string) {
-    return this.svc.getPoolSafe(eventId);
+  async pool(@Query('eventId') eventId: string) {
+    try {
+      return await this.svc.getPoolSafe(eventId);
+    } catch (e) {
+      // @ts-ignore
+      console.error('[GET /api/pool] ERROR:', e?.stack || e);
+      return { ok: false, error: errMessage(e) };
+    }
   }
 
-  // Promote queue → active (isi slot kosong; alias "Call Next")
+  @Get('diag-pool')
+  async diagPool(@Query('eventId') eventId: string) {
+    try {
+      return await this.svc.diagPool(eventId);
+    } catch (e) {
+      // @ts-ignore
+      console.error('[GET /api/diag-pool] ERROR:', e?.stack || e);
+      return { ok: false, error: errMessage(e) };
+    }
+  }
+
   @Post('promote')
-  promote(@Query('eventId') eventId: string) {
-    return this.svc.promoteQueueToActive(eventId);
+  async promote(@Query('eventId') eventId: string) {
+    try {
+      return await this.svc.promoteQueueToActive(eventId);
+    } catch (e) {
+      // @ts-ignore
+      console.error('[POST /api/promote] ERROR:', e?.stack || e);
+      return { ok: false, error: errMessage(e) };
+    }
   }
 
-  // Opsi endpoint lain utk kompatibilitas
-  @Post('call-next')
-  callNext(@Query('eventId') eventId: string) {
-    return this.svc.promoteQueueToActive(eventId);
-  }
-
-  // Skip ticket IN_PROCESS → DEFERRED
   @Post('skip/:idOrCode')
-  skip(@Param('idOrCode') idOrCode: string, @Query('eventId') eventId: string) {
-    return this.svc.skipActive(eventId, idOrCode);
+  async skip(@Query('eventId') eventId: string, @Param('idOrCode') idOrCode: string) {
+    try {
+      return await this.svc.skipActive(eventId, idOrCode);
+    } catch (e) {
+      // @ts-ignore
+      console.error('[POST /api/skip/:idOrCode] ERROR:', e?.stack || e, { idOrCode, eventId });
+      return { ok: false, error: errMessage(e) };
+    }
   }
 
-  // Recall: DEFERRED/QUEUED → IN_PROCESS (jika ada slot)
   @Post('recall/:idOrCode')
-  recall(@Param('idOrCode') idOrCode: string, @Query('eventId') eventId: string) {
-    return this.svc.recall(eventId, idOrCode);
+  async recall(@Query('eventId') eventId: string, @Param('idOrCode') idOrCode: string) {
+    try {
+      return await this.svc.recall(eventId, idOrCode);
+    } catch (e) {
+      // @ts-ignore
+      console.error('[POST /api/recall/:idOrCode] ERROR:', e?.stack || e, { idOrCode, eventId });
+      return { ok: false, error: errMessage(e) };
+    }
   }
 
-  // Kompat: recall-by-code/AH-001
   @Post('recall-by-code/:code')
-  recallByCode(@Param('code') code: string, @Query('eventId') eventId: string) {
-    return this.svc.recall(eventId, (code || '').toUpperCase());
+  async recallByCode(@Query('eventId') eventId: string, @Param('code') code: string) {
+    try {
+      return await this.svc.recallByCode(eventId, code.toUpperCase());
+    } catch (e) {
+      // @ts-ignore
+      console.error('[POST /api/recall-by-code/:code] ERROR:', e?.stack || e, { code, eventId });
+      return { ok: false, error: errMessage(e) };
+    }
   }
 
-  // Selesaikan tiket → DONE
   @Post('done/:idOrCode')
-  done(@Param('idOrCode') idOrCode: string, @Query('eventId') eventId: string) {
-    return this.svc.done(eventId, idOrCode);
+  async done(@Query('eventId') eventId: string, @Param('idOrCode') idOrCode: string) {
+    try {
+      return await this.svc.done(eventId, idOrCode);
+    } catch (e) {
+      // @ts-ignore
+      console.error('[POST /api/done/:idOrCode] ERROR:', e?.stack || e, { idOrCode, eventId });
+      return { ok: false, error: errMessage(e) };
+    }
+  }
+
+  // Endpoint kecil buat ngecek env & versi cepat
+  @Get('_debug_env')
+  env() {
+    return {
+      ok: true,
+      ACTIVE_SLOTS: Number(process.env.ACTIVE_SLOT_SIZE) || Number(process.env.NEXT_PUBLIC_ACTIVE_SLOT_SIZE) || 6,
+      NODE_ENV: process.env.NODE_ENV,
+      TS: new Date().toISOString(),
+    };
   }
 }
