@@ -51,8 +51,7 @@ model Ticket {
   status TicketStatus @default(CONFIRMED)
 
   // Queue (per batch 6)
-  batchNo    Int?
-  posInBatch Int?
+ 
 
   // Active (slot 1..6)
   slotNo Int?
