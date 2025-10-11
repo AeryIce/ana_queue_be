@@ -19,7 +19,7 @@ export class QueueService {
   // Helpers
   // ─────────────────────────────────────────────────────────
 
-  /** Resolve tiket by id / code (di event tertentu) */
+  /** Cari tiket by id atau code (dalam event tertentu) */
   private async findTicketByIdOrCode(
     tx: Prisma.TransactionClient,
     eventId: string,
@@ -28,11 +28,7 @@ export class QueueService {
     const { id, code } = idOrCode;
     if (!id && !code) throw new BadRequestException('id atau code wajib diisi');
     const t = await tx.ticket.findFirst({
-      where: {
-        eventId,
-        ...(id ? { id } : {}),
-        ...(code ? { code } : {}),
-      },
+      where: { eventId, ...(id ? { id } : {}), ...(code ? { code } : {}) },
     });
     if (!t) throw new NotFoundException('Ticket tidak ditemukan');
     return t;
@@ -41,9 +37,9 @@ export class QueueService {
   private parseIdOrCode(v: string): IdOrCode {
     const s = String(v || '').trim();
     if (!s) return {};
-    if (s.includes('-')) return { code: s };
+    if (s.includes('-')) return { code: s.toUpperCase() };
     if (s.length > 20) return { id: s };
-    return { code: s };
+    return { code: s.toUpperCase() };
   }
 
   // ─────────────────────────────────────────────────────────
@@ -54,8 +50,8 @@ export class QueueService {
   async board(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
-    // Ambil data utama
-    const [active, queued, deferred, next12] = await this.prisma.$transaction([
+    // Ambil tiga list utama sekaligus (tanpa query "next" terpisah)
+    const [active, queued, deferred] = await this.prisma.$transaction([
       this.prisma.ticket.findMany({
         where: { eventId, status: TicketStatus.IN_PROCESS },
         orderBy: [{ order: 'asc' }],
@@ -71,15 +67,12 @@ export class QueueService {
         orderBy: [{ updatedAt: 'desc' }],
         select: { id: true, code: true, name: true, status: true, order: true },
       }),
-      this.prisma.ticket.findMany({
-        where: { eventId, status: TicketStatus.QUEUED },
-        orderBy: [{ order: 'asc' }],
-        take: 12,
-        select: { id: true, code: true, name: true, status: true, order: true },
-      }),
     ]);
 
-    // Totals
+    // next = potongan awal dari queued → konsisten & hemat query
+    const next = queued.slice(0, 60);
+
+    // Totals lain tetap dihitung terpisah
     const [a, q, c, d, dn] = await Promise.all([
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.IN_PROCESS } }),
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.QUEUED } }),
@@ -102,8 +95,8 @@ export class QueueService {
       active,
       queue: queued,
       skipGrid: deferred,
-      next: next12,
-      nextCount: next12.length,
+      next,
+      nextCount: next.length,
       totals,
     };
   }
@@ -122,7 +115,7 @@ export class QueueService {
     return { ok: true, eventId, pool: Number(r?.[0]?.balance ?? 0), method: 'getPoolSafe' };
   }
 
-  /** Diagnostik pool + sample 5 baris */
+  /** Diagnostik pool + beberapa baris terbaru */
   async diagPool(eventId: string) {
     const s = await this.getPoolSafe(eventId);
     const last = await this.prisma.surplusLedger.findMany({
@@ -148,7 +141,7 @@ export class QueueService {
   // PROMOTE / SKIP / RECALL / DONE (tanpa slotNo/batchNo)
   // ─────────────────────────────────────────────────────────
 
-  /** Naikkan QUEUED → IN_PROCESS (maks ACTlVE_SLOTS) */
+  /** Naikkan QUEUED → IN_PROCESS sampai kapasitas slot aktif */
   async promoteQueueToActive(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
@@ -209,7 +202,7 @@ export class QueueService {
   /**
    * Recall:
    * - Jika ada kapasitas → DEFERRED/QUEUED → IN_PROCESS
-   * - Jika penuh & sumber DEFERRED → kembalikan ke QUEUED (supaya ikut antrian)
+   * - Jika penuh & sumber DEFERRED → kembalikan ke QUEUED (ikut antrian)
    */
   async recall(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
@@ -251,5 +244,13 @@ export class QueueService {
       });
       return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.DONE };
     });
+  }
+
+  // ── Aliases untuk kompatibilitas controller/legacy ───────────────────────────
+  async promote(eventId: string) {
+    return this.promoteQueueToActive(eventId);
+  }
+  async recallByCode(eventId: string, code: string) {
+    return this.recall(eventId, code);
   }
 }
