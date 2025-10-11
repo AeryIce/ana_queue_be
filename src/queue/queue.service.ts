@@ -16,43 +16,21 @@ export class QueueService {
   constructor(private readonly prisma: PrismaService) {}
 
   // ─────────────────────────────────────────────────────────
-  // Helpers
+  // Helpers (tanpa slotNo / batchNo)
   // ─────────────────────────────────────────────────────────
 
-  /** Ambil slot yang sedang terpakai (IN_PROCESS) di event */
-  private async getUsedSlots(
-    tx: Prisma.TransactionClient,
-    eventId: string,
-  ): Promise<number[]> {
-    const rows = await tx.ticket.findMany({
-      where: { eventId, status: TicketStatus.IN_PROCESS, slotNo: { not: null } },
-      select: { slotNo: true },
-    });
-    return rows
-      .map((r) => (typeof r.slotNo === 'number' ? r.slotNo : -1))
-      .filter((n) => n > 0)
-      .sort((a, b) => a - b);
+  /** berapa tiket IN_PROCESS saat ini */
+  private async countActive(tx: Prisma.TransactionClient, eventId: string): Promise<number> {
+    return tx.ticket.count({ where: { eventId, status: TicketStatus.IN_PROCESS } });
   }
 
-  /** Ambil slot kosong (1..N) berdasarkan slot terpakai  */
-  private async getFreeSlots(
-    tx: Prisma.TransactionClient,
-    eventId: string,
-    N = ACTIVE_SLOTS,
-  ): Promise<number[]> {
-    const used = await this.getUsedSlots(tx, eventId);
-    const all = Array.from({ length: N }, (_, i) => i + 1);
-    return all.filter((s) => !used.includes(s));
-  }
-
-  /** Resolve tiket by id / code (di event tertentu) */
+  /** resolve tiket by id / code (event tertentu) */
   private async findTicketByIdOrCode(
     tx: Prisma.TransactionClient,
     eventId: string,
     idOrCode: IdOrCode,
   ) {
-    const { id } = idOrCode;
-    const code = idOrCode.code?.toUpperCase(); // normalisasi code
+    const { id, code } = idOrCode;
     if (!id && !code) throw new BadRequestException('id atau code wajib diisi');
     const t = await tx.ticket.findFirst({
       where: {
@@ -68,25 +46,25 @@ export class QueueService {
   private parseIdOrCode(v: string): IdOrCode {
     const s = String(v || '').trim();
     if (!s) return {};
-    if (s.includes('-')) return { code: s.toUpperCase() };
+    if (s.includes('-')) return { code: s };
     if (s.length > 20) return { id: s };
-    return { code: s.toUpperCase() };
+    return { code: s };
   }
 
   // ─────────────────────────────────────────────────────────
   // BOARD + POOL
   // ─────────────────────────────────────────────────────────
 
-  /** Snapshot untuk TV/Queue/Admin */
+  /** Snapshot untuk TV/Queue/Admin (tanpa slotNo) */
   async board(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
-    // ambil list dengan transaksi (semua PrismaPromise)
+    // daftar data utama (PrismaPromise semua)
     const [active, queued, deferred, next12] = await this.prisma.$transaction([
       this.prisma.ticket.findMany({
         where: { eventId, status: TicketStatus.IN_PROCESS },
-        orderBy: [{ slotNo: 'asc' }, { order: 'asc' }],
-        select: { id: true, code: true, name: true, status: true, order: true, slotNo: true },
+        orderBy: [{ order: 'asc' }],
+        select: { id: true, code: true, name: true, status: true, order: true },
       }),
       this.prisma.ticket.findMany({
         where: { eventId, status: TicketStatus.QUEUED },
@@ -106,11 +84,11 @@ export class QueueService {
       }),
     ]);
 
-    // hitung totals DI LUAR $transaction (bukan PrismaPromise)
+    // totals
     const [a, q, c, d, dn] = await Promise.all([
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.IN_PROCESS } }),
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.QUEUED } }),
-      this.prisma.ticket.count({ where: { eventId, status: TicketStatus.CALLED } }), // jika tidak dipakai akan 0
+      this.prisma.ticket.count({ where: { eventId, status: TicketStatus.CALLED } }),
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.DEFERRED } }),
       this.prisma.ticket.count({ where: { eventId, status: TicketStatus.DONE } }),
     ]);
@@ -119,7 +97,7 @@ export class QueueService {
       active: a,
       queue: q,
       called: c,
-      skip: d, // skip grid = DEFERRED
+      skip: d, // pakai DEFERRED untuk grid "skipped"
       done: dn,
       queueBatches: Math.ceil(q / ACTIVE_SLOTS),
     };
@@ -149,7 +127,7 @@ export class QueueService {
     return { ok: true, eventId, pool: Number(r?.[0]?.balance ?? 0), method: 'getPoolSafe' };
   }
 
-  /** Diagnostik pool + sample 5 baris */
+  /** Diagnostik pool + sample */
   async diagPool(eventId: string) {
     const s = await this.getPoolSafe(eventId);
     const last = await this.prisma.surplusLedger.findMany({
@@ -172,23 +150,24 @@ export class QueueService {
   }
 
   // ─────────────────────────────────────────────────────────
-  // PROMOTE / SKIP / RECALL / DONE
+  // PROMOTE / SKIP / RECALL / DONE  (tanpa slotNo)
   // ─────────────────────────────────────────────────────────
 
-  /** Naikkan QUEUED → IN_PROCESS untuk slot kosong, FIFO */
+  /** Naikkan QUEUED → IN_PROCESS sampai kuota ACTIVE_SLOTS terpenuhi */
   async promoteQueueToActive(eventId: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
 
     return this.prisma.$transaction(async (tx) => {
-      const free = await this.getFreeSlots(tx, eventId, ACTIVE_SLOTS);
-      if (free.length === 0) {
-        return { ok: true, promoted: 0, codes: [], reason: 'no-free-slot' };
+      const curActive = await this.countActive(tx, eventId);
+      const capacity = Math.max(0, ACTIVE_SLOTS - curActive);
+      if (capacity <= 0) {
+        return { ok: true, promoted: 0, codes: [], reason: 'no-free-capacity' };
       }
 
       const pick = await tx.ticket.findMany({
         where: { eventId, status: TicketStatus.QUEUED },
         orderBy: { order: 'asc' },
-        take: free.length,
+        take: capacity,
         select: { id: true, code: true },
       });
 
@@ -196,13 +175,10 @@ export class QueueService {
         return { ok: true, promoted: 0, codes: [], reason: 'queue-empty' };
       }
 
-      // pasangkan tiket ke slot kosong terendah
-      const toUpdate = pick.map((t, i) => ({ id: t.id, slotNo: free[i] }));
-
-      for (const u of toUpdate) {
+      for (const t of pick) {
         await tx.ticket.update({
-          where: { id: u.id },
-          data: { status: TicketStatus.IN_PROCESS, slotNo: u.slotNo, updatedAt: new Date() },
+          where: { id: t.id },
+          data: { status: TicketStatus.IN_PROCESS, updatedAt: new Date() },
         });
       }
 
@@ -216,12 +192,7 @@ export class QueueService {
     return this.promoteQueueToActive(eventId);
   }
 
-  /** Alias untuk controller lama: promote() */
-  async promote(eventId: string) {
-    return this.promoteQueueToActive(eventId);
-  }
-
-  /** Skip  IN_PROCESS → DEFERRED (bebaskan slot) */
+  /** Skip: IN_PROCESS → DEFERRED */
   async skipActive(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
@@ -231,53 +202,55 @@ export class QueueService {
       }
       await tx.ticket.update({
         where: { id: t.id },
-        data: { status: TicketStatus.DEFERRED, slotNo: null, updatedAt: new Date() },
+        data: { status: TicketStatus.DEFERRED, updatedAt: new Date() },
       });
       return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.DEFERRED };
     });
   }
 
-  /** Recall DEFERRED/QUEUED → IN_PROCESS bila ada slot kosong; jika penuh dan status DEFERRED → kembalikan ke QUEUED */
+  /** Recall: jika kapasitas masih ada → ke IN_PROCESS; jika penuh dan dari DEFERRED → kembalikan ke QUEUED */
   async recall(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
       const t = await this.findTicketByIdOrCode(tx, eventId, this.parseIdOrCode(idOrCode));
 
-      const free = await this.getFreeSlots(tx, eventId, ACTIVE_SLOTS);
-      if (free.length === 0) {
-        // tidak ada slot: kalau DEFERRED → antrikan lagi
+      const curActive = await this.countActive(tx, eventId);
+      const hasCapacity = curActive < ACTIVE_SLOTS;
+
+      if (!hasCapacity) {
         if (t.status === TicketStatus.DEFERRED) {
           await tx.ticket.update({
             where: { id: t.id },
-            data: { status: TicketStatus.QUEUED, slotNo: null, updatedAt: new Date() },
+            data: { status: TicketStatus.QUEUED, updatedAt: new Date() },
           });
-          return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.QUEUED, reason: 'no-free-slot' };
+          return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.QUEUED, reason: 'no-free-capacity' };
         }
-        return { ok: false, error: 'Tidak ada slot kosong' };
+        return { ok: false, error: 'Tidak ada kapasitas aktif' };
       }
 
-      const slot = free[0];
       await tx.ticket.update({
         where: { id: t.id },
-        data: { status: TicketStatus.IN_PROCESS, slotNo: slot, updatedAt: new Date() },
+        data: { status: TicketStatus.IN_PROCESS, updatedAt: new Date() },
       });
-      return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.IN_PROCESS, slotNo: slot };
+      return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.IN_PROCESS };
     });
   }
 
-  /** Alias untuk controller lama: recallByCode() */
+  /** Recall by code (untuk endpoint /api/recall-by-code/:code) */
   async recallByCode(eventId: string, code: string) {
-    return this.recall(eventId, code);
+    const v = String(code || '').trim().toUpperCase();
+    if (!v) throw new BadRequestException('code wajib diisi');
+    return this.recall(eventId, v);
   }
 
-  /** Selesaikan → DONE (bebaskan slot) */
+  /** Selesaikan → DONE */
   async done(eventId: string, idOrCode: string) {
     if (!eventId) throw new BadRequestException('eventId wajib diisi');
     return this.prisma.$transaction(async (tx) => {
       const t = await this.findTicketByIdOrCode(tx, eventId, this.parseIdOrCode(idOrCode));
       await tx.ticket.update({
         where: { id: t.id },
-        data: { status: TicketStatus.DONE, slotNo: null, updatedAt: new Date() },
+        data: { status: TicketStatus.DONE, updatedAt: new Date() },
       });
       return { ok: true, id: t.id, code: t.code, newStatus: TicketStatus.DONE };
     });
