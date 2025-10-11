@@ -76,7 +76,7 @@ model Ticket {
   updatedAt DateTime @updatedAt
 
   @@index([eventId, status], name: "Ticket_eventId_status_idx")
-  @@index([eventId, batchNo, posInBatch], name: "Ticket_eventId_batchNo_posInBatch_idx")
+
   @@index([eventId, slotNo], name: "Ticket_eventId_slotNo_idx")
   @@index([eventId, isSkipped, status], name: "Ticket_eventId_isSkipped_status_idx")
 }
