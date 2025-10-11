@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Query, Param, Body, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query } from '@nestjs/common';
 import { QueueService } from './queue.service';
 
 @Controller('api')
@@ -6,57 +6,82 @@ export class QueueController {
   constructor(private readonly svc: QueueService) {}
 
   @Get('board')
-  async board(@Query('eventId') eventId: string) {
-    return this.svc.board(eventId);
+  async board(@Query('eventId') eventId = 'seed-event') {
+    try {
+      return await this.svc.board(eventId);
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'board failed' };
+    }
   }
 
   @Get('pool')
-  async pool(@Query('eventId') eventId: string) {
-    return this.svc.getPoolSafe(eventId);
+  async pool(@Query('eventId') eventId = 'seed-event') {
+    try {
+      return await this.svc.getPoolSafe(eventId);
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'pool failed' };
+    }
   }
 
-  @Get('diag-pool')
-  async diag(@Query('eventId') eventId: string) {
-    return this.svc.diagPool(eventId);
+  @Get('pool/diag')
+  async diag(@Query('eventId') eventId = 'seed-event') {
+    try {
+      return await this.svc.diagPool(eventId);
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'diag failed' };
+    }
   }
 
-  // Call next = promote queued → in_process (hingga kapasitas slot aktif)
+  // === TEAM B controls ===
+
+  // Call Next (promote queued -> in_process) — POST!
   @Post('promote')
-  async promote(@Query('eventId') eventId: string) {
-    return this.svc.promoteQueueToActive(eventId);
+  async promote(@Query('eventId') eventId = 'seed-event') {
+    try {
+      const r = await this.svc.promoteQueueToActive(eventId);
+      return { ok: true, ...r };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'promote failed' };
+    }
   }
 
-  // Alias kalau FE masih pakai endpoint lama
-  @Post('call-next')
-  async callNext(@Query('eventId') eventId: string) {
-    return this.svc.promoteQueueToActive(eventId);
-  }
-
+  // Skip active -> deferred
   @Post('skip/:id')
-  async skip(@Param('id') id: string, @Query('eventId') eventId: string) {
-    return this.svc.skipActive(eventId, id);
+  async skip(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
+    try {
+      return await this.svc.skipActive(eventId, id);
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'skip failed' };
+    }
   }
 
+  // Recall by code or id (support legacy route name)
   @Post('recall/:id')
-  async recall(@Param('id') id: string, @Query('eventId') eventId: string) {
-    return this.svc.recall(eventId, id);
+  async recall(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
+    try {
+      return await this.svc.recall(eventId, id);
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'recall failed' };
+    }
   }
 
-  // FE kamu manggil /recall-by-code/AH-001 → arahkan ke recall() dengan code
+  // Legacy alias used by FE: /api/recall-by-code/:code
   @Post('recall-by-code/:code')
-  async recallByCode(@Param('code') code: string, @Query('eventId') eventId: string) {
-    return this.svc.recall(eventId, code.toUpperCase());
+  async recallByCode(@Param('code') code: string, @Query('eventId') eventId = 'seed-event') {
+    try {
+      return await this.svc.recall(eventId, code.toUpperCase());
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'recall-by-code failed' };
+    }
   }
 
+  // Done (finish)
   @Post('done/:id')
-  async done(@Param('id') id: string, @Query('eventId') eventId: string) {
-    return this.svc.done(eventId, id);
-  }
-
-  @Post('donate')
-  async donate(@Query('eventId') eventId: string, @Body('amount') amount?: number) {
-    if (!eventId) throw new BadRequestException('eventId wajib diisi');
-    const amt = Number.isFinite(Number(amount)) ? Number(amount) : 0;
-    return this.svc.donate(eventId, amt);
+  async done(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
+    try {
+      return await this.svc.done(eventId, id);
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'done failed' };
+    }
   }
 }
