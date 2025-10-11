@@ -1,4 +1,4 @@
-// src/queue/queue.controller.ts — REPLACE ALL
+// src/queue/queue.controller.ts — FIXED (no duplicate ok)
 
 import { Controller, Get, Post, Param, Query } from '@nestjs/common';
 import { QueueService } from './queue.service';
@@ -12,8 +12,7 @@ export class QueueController {
   @Get('board')
   async board(@Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.board(eventId);
-      return { ok: true, ...r };
+      return await this.svc.board(eventId);
     } catch (e: any) {
       return { ok: false, error: e?.message || 'board failed' };
     }
@@ -22,8 +21,7 @@ export class QueueController {
   @Get('pool')
   async pool(@Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.getPoolSafe(eventId);
-      return { ok: true, ...r };
+      return await this.svc.getPoolSafe(eventId);
     } catch (e: any) {
       return { ok: false, error: e?.message || 'pool failed' };
     }
@@ -32,8 +30,7 @@ export class QueueController {
   @Get('pool/diag')
   async diag(@Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.diagPool(eventId);
-      return { ok: true, ...r };
+      return await this.svc.diagPool(eventId);
     } catch (e: any) {
       return { ok: false, error: e?.message || 'diag failed' };
     }
@@ -45,8 +42,7 @@ export class QueueController {
   @Post('promote')
   async promote(@Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.promoteQueueToActive(eventId);
-      return r; // service sudah mengandung { ok, promoted, codes, reason }
+      return await this.svc.promoteQueueToActive(eventId);
     } catch (e: any) {
       return { ok: false, error: e?.message || 'promote failed' };
     }
@@ -56,8 +52,7 @@ export class QueueController {
   @Post('skip/:id')
   async skip(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.skipActive(eventId, id);
-      return r;
+      return await this.svc.skipActive(eventId, id);
     } catch (e: any) {
       return { ok: false, error: e?.message || 'skip failed' };
     }
@@ -67,8 +62,7 @@ export class QueueController {
   @Post('recall/:id')
   async recall(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.recall(eventId, id);
-      return r;
+      return await this.svc.recall(eventId, id);
     } catch (e: any) {
       return { ok: false, error: e?.message || 'recall failed' };
     }
@@ -78,8 +72,7 @@ export class QueueController {
   @Post('recall-by-code/:code')
   async recallByCode(@Param('code') code: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.recall(eventId, code.toUpperCase());
-      return r;
+      return await this.svc.recall(eventId, code.toUpperCase());
     } catch (e: any) {
       return { ok: false, error: e?.message || 'recall-by-code failed' };
     }
@@ -89,8 +82,7 @@ export class QueueController {
   @Post('done/:id')
   async done(@Param('id') id: string, @Query('eventId') eventId = 'seed-event') {
     try {
-      const r = await this.svc.done(eventId, id);
-      return r;
+      return await this.svc.done(eventId, id);
     } catch (e: any) {
       return { ok: false, error: e?.message || 'done failed' };
     }
